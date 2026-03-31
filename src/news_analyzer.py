@@ -19,13 +19,14 @@ class NewsSentimentAnalyzer:
         self.base_url = NEWS_API_BASE_URL
         self.session = requests.Session()
 
-        # Keywords relevant to Kalshi markets (political, economic, events)
+        # Keywords focused on crypto markets
         self.keywords = [
-            'election', 'president', 'senate', 'congress', 'federal reserve',
-            'economy', 'inflation', 'unemployment', 'GDP', 'policy',
-            'Supreme Court', 'court', 'ruling', 'decision', 'vote',
-            'political', 'government', 'administration', 'democrat', 'republican',
-            'market', 'stock', 'trading', 'finance', 'economic'
+            'bitcoin', 'BTC', 'ethereum', 'ETH', 'solana', 'SOL',
+            'crypto', 'cryptocurrency', 'blockchain',
+            'bitcoin price', 'crypto market', 'bitcoin ETF', 'ethereum ETF',
+            'crypto regulation', 'SEC crypto', 'bitcoin reserve',
+            'stablecoin', 'DeFi', 'crypto exchange',
+            'federal reserve', 'interest rate', 'inflation',
         ]
 
     def fetch_news(self, query: str = None, days_back: int = 1) -> List[Dict[str, Any]]:

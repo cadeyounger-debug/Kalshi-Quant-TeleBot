@@ -48,16 +48,18 @@ class MarketData:
 class MarketDataStreamer:
     """Enhanced market data streaming and management."""
 
-    def __init__(self, api_client, update_interval: int = 30):
+    def __init__(self, api_client, update_interval: int = 30, event_tickers: List[str] = None):
         """
         Initialize market data streamer.
 
         Args:
             api_client: Kalshi API client instance
             update_interval: Seconds between data updates
+            event_tickers: If set, only stream markets from these events
         """
         self.api_client = api_client
         self.update_interval = update_interval
+        self.event_tickers = event_tickers or []
         self.markets_data: Dict[str, MarketData] = {}
         self.subscribers: List[Callable] = []
         self.running = False
@@ -112,22 +114,31 @@ class MarketDataStreamer:
     def _update_market_data(self):
         """Fetch and update market data."""
         try:
-            # Get fresh market data from API
-            raw_markets = self.api_client.get_markets()
+            # Fetch markets from specific events if configured, otherwise all
+            all_raw_markets = []
+            if self.event_tickers:
+                for event_ticker in self.event_tickers:
+                    resp = self.api_client.get_markets(params={"event_ticker": event_ticker, "limit": 200})
+                    if resp and resp.get("markets"):
+                        all_raw_markets.extend(resp["markets"])
+            else:
+                raw_markets = self.api_client.get_markets()
+                if raw_markets and 'markets' in raw_markets:
+                    all_raw_markets = raw_markets['markets']
 
-            if not raw_markets or 'markets' not in raw_markets:
+            if not all_raw_markets:
                 logger.warning("No market data received from API")
                 return
 
             updated_markets = []
 
-            for market in raw_markets['markets'][:20]:  # Limit for performance
-                market_id = market.get('id')
+            for market in all_raw_markets:
+                market_id = market.get('ticker') or market.get('id')
                 if not market_id:
                     continue
 
-                # Extract market data
-                current_price = market.get('current_price')
+                # Extract market data — Kalshi v2 uses yes_ask/last_price (cents)
+                current_price = market.get('yes_ask') or market.get('last_price') or market.get('current_price')
                 if current_price is None:
                     continue
 

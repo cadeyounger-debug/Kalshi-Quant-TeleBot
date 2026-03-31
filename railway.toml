@@ -1,8 +1,8 @@
 [build]
 builder = "NIXPACKS"
-nixpacks = { providers = ["node", "python"] }
-buildCommand = "cd telegram_ui && npm install"
-startCommand = "cd telegram_ui && npm start"
+nixpacks = { providers = ["python", "node"] }
+buildCommand = "pip install -r requirements.txt && cd telegram_ui && npm install"
+startCommand = "bash start.sh"
 
 [deploy]
 restartPolicyType = "ON_FAILURE"

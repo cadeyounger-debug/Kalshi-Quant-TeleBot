@@ -450,19 +450,22 @@ class BotInterface {
     }
 
     // Phase 4: Run bot state command via CLI
+    buildPythonEnv() {
+        const env = { ...process.env };
+        if (this.kalshiApiKey) env.KALSHI_API_KEY = this.kalshiApiKey;
+        if (this.kalshiApiBaseUrl) env.KALSHI_API_BASE_URL = this.kalshiApiBaseUrl;
+        return env;
+    }
+
     runBotStateCommand(command) {
         return new Promise((resolve, reject) => {
-            if (!this.pythonProcess) {
-                reject(new Error('Python bot not running'));
-                return;
-            }
-
             const script = this.botStateScript;
             const args = [script, command];
 
             const child = spawn('python3', args, {
                 cwd: path.dirname(script),
-                stdio: ['pipe', 'pipe', 'pipe']
+                stdio: ['pipe', 'pipe', 'pipe'],
+                env: this.buildPythonEnv()
             });
 
             let stdout = '';
@@ -498,18 +501,14 @@ class BotInterface {
     // Phase 4: Run bot state command with input data
     runBotStateCommandWithInput(command, data) {
         return new Promise((resolve, reject) => {
-            if (!this.pythonProcess) {
-                reject(new Error('Python bot not running'));
-                return;
-            }
-
             const script = this.botStateScript;
             const jsonData = JSON.stringify(data);
             const args = [script, command, '--data', jsonData];
 
             const child = spawn('python3', args, {
                 cwd: path.dirname(script),
-                stdio: ['pipe', 'pipe', 'pipe']
+                stdio: ['pipe', 'pipe', 'pipe'],
+                env: this.buildPythonEnv()
             });
 
             let stdout = '';

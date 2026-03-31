@@ -20,12 +20,15 @@ class Trader:
         self.bankroll = bankroll
         self.current_positions = {}
         self.news_analyzer = NewsSentimentAnalyzer()
-        self.arbitrage_analyzer = StatisticalArbitrageAnalyzer()
-        self.volatility_analyzer = VolatilityAnalyzer()
+        self.arbitrage_analyzer = StatisticalArbitrageAnalyzer(min_history_points=20)
+        self.volatility_analyzer = VolatilityAnalyzer(min_history_points=20)
         self.risk_manager = RiskManager(bankroll)
 
-        # Phase 3: Enhanced market data and performance tracking
-        self.market_data_streamer = MarketDataStreamer(api, update_interval=60)  # Update every minute
+        # Phase 3: Enhanced market data — stream crypto markets specifically
+        crypto_events = self._build_crypto_event_tickers()
+        self.market_data_streamer = MarketDataStreamer(
+            api, update_interval=60, event_tickers=crypto_events
+        )
         self.performance_analytics = PerformanceAnalytics()
 
         # Phase 4: Dynamic settings management
@@ -96,11 +99,13 @@ class Trader:
                 if sentiment_decision['should_trade']:
                     self.logger.info(f"News sentiment signal: {sentiment_decision['reason']}")
 
-                    # Find suitable market to trade based on sentiment
+                    # Find the best market by picking the one with the most
+                    # extreme price (closest to 0 or 1) as it has the most
+                    # upside potential on a directional sentiment bet.
                     if market_data and 'markets' in market_data and market_data['markets']:
-                        market = market_data['markets'][0]  # Simple selection - could be enhanced
-                        event_id = market.get('id')
-                        current_price = market.get('current_price')
+                        market = self._pick_best_market(market_data['markets'], sentiment_decision['direction'])
+                        event_id = market.get('ticker') or market.get('id')
+                        current_price = market.get('yes_ask') or market.get('last_price') or market.get('current_price')
 
                         if event_id and current_price:
                             action = 'buy' if sentiment_decision['direction'] == 'long' else 'sell'
@@ -180,11 +185,10 @@ class Trader:
                 if volatility_decision and volatility_decision.get('should_trade'):
                     self.logger.info(f"Volatility signal: {volatility_decision['reason']}")
 
-                    # Find market for volatility-based trade
-                    if market_data and 'markets' in market_data and market_data['markets']:
-                        market = market_data['markets'][0]  # Could be enhanced to select based on volatility
-                        event_id = market.get('id')
-                        current_price = market.get('current_price')
+                    market = volatility_decision.get('market')
+                    if market:
+                        event_id = market.get('ticker') or market.get('id')
+                        current_price = market.get('yes_ask') or market.get('last_price') or market.get('current_price')
 
                         if event_id and current_price and volatility_decision.get('direction'):
                             action = 'buy' if volatility_decision['direction'] == 'long' else 'sell'
@@ -213,9 +217,175 @@ class Trader:
 
         return trade_decision
 
+    def _build_crypto_event_tickers(self):
+        """Build list of BTC/ETH/SOL event tickers to watch.
+
+        Covers year-end price, monthly min/max, daily, and hourly events.
+        """
+        from datetime import datetime, timedelta
+
+        tickers = [
+            # Year-end price events (highest liquidity)
+            "KXBTCY-27JAN0100",
+            "KXETHY-27JAN0100",
+            "KXSOLD26-27JAN0100",
+            "KXSOL26500-27JAN0100",
+            # Cross-crypto / thematic
+            "KXBTCVSGOLD-26",
+            "KXBTCRESERVE-27",
+        ]
+
+        now = datetime.now()
+
+        # Monthly min/max for current and next month
+        for month_offset in range(0, 2):
+            if month_offset == 0:
+                next_m = now.month + 1 if now.month < 12 else 1
+                next_y = now.year if now.month < 12 else now.year + 1
+                end = datetime(next_y, next_m, 1) - timedelta(days=1)
+            else:
+                next_m = now.month + 2 if now.month < 11 else (now.month + 2 - 12)
+                next_y = now.year if now.month < 11 else now.year + 1
+                end = datetime(next_y, next_m, 1) - timedelta(days=1)
+
+            dt = end.strftime("%y%b%d").upper()
+            for coin, code in [("BTC", "BTC"), ("ETH", "ETH"), ("SOL", "SOL")]:
+                tickers.append(f"KX{coin}MAXMON-{code}-{dt}")
+                tickers.append(f"KX{coin}MINMON-{code}-{dt}")
+
+        # Daily price events for next 7 days
+        for days_ahead in range(0, 7):
+            d = now + timedelta(days=days_ahead)
+            ds = d.strftime("%y%b%d").upper()
+            for coin in ["KXBTC", "KXETH", "KXSOL"]:
+                tickers.append(f"{coin}-{ds}0100")
+
+        # Hourly (1H) events for next 12 hours
+        for hours_ahead in range(0, 12):
+            t = now + timedelta(hours=hours_ahead)
+            ds = t.strftime("%y%b%d").upper()
+            h = t.hour
+            for coin in ["KXBTC1H", "KXETH1H", "KXSOL1H"]:
+                tickers.append(f"{coin}-{ds}{h:02d}00")
+
+        # 15-minute events for next 2 hours
+        for mins_ahead in range(0, 120, 15):
+            t = now + timedelta(minutes=mins_ahead)
+            ds = t.strftime("%y%b%d").upper()
+            hm = t.strftime("%H%M")
+            # Round to nearest 15
+            m15 = (t.minute // 15) * 15
+            hm = f"{t.hour:02d}{m15:02d}"
+            for coin in ["KXBTC15M", "KXETH15M", "KXSOL15M"]:
+                tickers.append(f"{coin}-{ds}{hm}")
+
+        # Deduplicate
+        return list(dict.fromkeys(tickers))
+
+    def _fetch_all_markets(self):
+        """Fetch active BTC/ETH/SOL crypto markets with liquidity.
+
+        Caches results and refreshes every 5 cycles.
+        """
+        if not hasattr(self, '_market_cache'):
+            self._market_cache = []
+            self._cache_cycle = 0
+
+        self._cache_cycle += 1
+
+        if self._market_cache and self._cache_cycle % 5 != 1:
+            self.logger.info(f"Using cached crypto markets ({len(self._market_cache)} markets)")
+            return self._market_cache
+
+        event_tickers = self._build_crypto_event_tickers()
+        all_markets = []
+        for event_ticker in event_tickers:
+            resp = self.api.get_markets(params={"event_ticker": event_ticker, "limit": 200})
+            if resp and resp.get("markets"):
+                for m in resp["markets"]:
+                    if m.get("status") == "active" and m.get("yes_bid_dollars", "0.0000") != "0.0000":
+                        all_markets.append(m)
+
+        self._market_cache = all_markets
+        self.logger.info(f"Fetched {len(all_markets)} active BTC/ETH/SOL markets with liquidity")
+        return all_markets
+
+    def run_trading_strategy(self):
+        """Main trading loop iteration: fetch all markets, analyse, execute."""
+        try:
+            markets = self._fetch_all_markets()
+            if not markets:
+                self.logger.info("No markets returned from API")
+                return
+
+            market_data = {"markets": markets}
+            trade_decision = self._make_trade_decision(market_data)
+            if trade_decision:
+                self.execute_trade(trade_decision)
+            else:
+                self.logger.info(f"No trade signal this cycle ({len(markets)} markets scanned)")
+        except Exception as e:
+            self.logger.error(f"Error in trading strategy: {e}")
+
+    def _statistical_arbitrage(self, market_data):
+        """Find statistical arbitrage opportunities across markets."""
+        markets = market_data.get("markets", [])
+        # Build enriched list with price history from the streamer
+        enriched = []
+        for m in markets:
+            mid = m.get("ticker") or m.get("id")
+            streamer_data = self.market_data_streamer.get_market_data(mid)
+            history = streamer_data.price_history if streamer_data else []
+            enriched.append({
+                "id": mid,
+                "title": m.get("title", ""),
+                "current_price": m.get("yes_ask") or m.get("last_price") or 0,
+                "price_history": history,
+            })
+        return self.arbitrage_analyzer.find_arbitrage_opportunities(enriched)
+
+    def _volatility_analysis(self, market_data):
+        """Run volatility analysis across markets and return best signal."""
+        markets = market_data.get("markets", [])
+        best = None
+        for m in markets:
+            mid = m.get("ticker") or m.get("id")
+            streamer_data = self.market_data_streamer.get_market_data(mid)
+            history = streamer_data.price_history if streamer_data else []
+            if len(history) < 20:
+                continue
+            vol_analysis = self.volatility_analyzer.analyze_market_volatility({
+                "id": mid,
+                "title": m.get("title", ""),
+                "current_price": m.get("yes_ask") or m.get("last_price") or 0,
+                "price_history": history,
+            })
+            decision = self.volatility_analyzer.should_trade_based_on_volatility(vol_analysis)
+            if decision.get("should_trade"):
+                if best is None or decision["confidence"] > best["confidence"]:
+                    best = decision
+                    best["market"] = m
+        return best
+
+    def _pick_best_market(self, markets, direction):
+        """Pick the market with the most upside for the given direction."""
+        scored = []
+        for m in markets:
+            price = m.get('yes_ask') or m.get('last_price') or m.get('current_price')
+            if not price or price <= 0:
+                continue
+            # For a long bet we want cheap yes contracts; for short, expensive ones
+            if direction == 'long':
+                score = 1.0 - (price / 100 if price > 1 else price)
+            else:
+                score = price / 100 if price > 1 else price
+            scored.append((score, m))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1] if scored else markets[0]
+
     def execute_trade(self, trade_decision):
         """
-        Execute trade with basic risk management
+        Execute trade via the Kalshi API with risk management.
         """
         if not trade_decision:
             self.logger.info("No trade decision to execute.")
@@ -227,24 +397,42 @@ class Trader:
         price = trade_decision['price']
         strategy = trade_decision.get('strategy', 'unknown')
 
+        # Kalshi prices are in cents (1-99); normalise if needed
+        price_cents = int(price) if price > 1 else int(price * 100)
+
         try:
             # Validate position size
-            position_value = quantity * price
+            position_value = quantity * price_cents
             if not self.risk_manager.validate_position_size(position_value):
-                self.logger.warning(f"Position size ${position_value:.2f} exceeds risk limits")
+                self.logger.warning(f"Position size {position_value}¢ exceeds risk limits")
                 return
 
             self.logger.info(f"Executing {strategy} trade: {action} {quantity} units of {event_id} "
-                           f"at ${price:.2f}")
+                           f"at {price_cents}¢")
 
             # Generate unique trade ID
             trade_id = f"{strategy}_{event_id}_{int(time.time())}"
 
-            # Execute the trade via API (placeholder for now)
-            if action.lower() == 'buy':
-                self.logger.info(f"BUY ORDER: {quantity} units of {event_id} at ${price:.2f}")
-            elif action.lower() == 'sell':
-                self.logger.info(f"SELL ORDER: {quantity} units of {event_id} at ${price:.2f}")
+            # Build Kalshi order payload
+            side = 'yes' if action.lower() == 'buy' else 'no'
+            order_payload = {
+                'ticker': event_id,
+                'action': 'buy',
+                'side': side,
+                'count': quantity,
+                'type': 'limit',
+                'yes_price': price_cents if side == 'yes' else None,
+                'no_price': price_cents if side == 'no' else None,
+            }
+            # Remove None values
+            order_payload = {k: v for k, v in order_payload.items() if v is not None}
+
+            result = self.api.create_order(order_payload)
+            if result:
+                self.logger.info(f"ORDER PLACED: {result}")
+            else:
+                self.logger.error(f"Order failed for {event_id}")
+                return
 
             # Record trade in performance analytics
             trade = Trade(

@@ -41,12 +41,14 @@ def fetch_balance(api: KalshiAPI) -> Dict[str, Any]:
 
     summary = {
         "available": _cents_to_dollars(
-            raw.get("available_cash")
+            raw.get("balance")
+            or raw.get("available_cash")
             or raw.get("available_balance")
             or raw.get("cash_balance")
         ),
         "total_equity": _cents_to_dollars(
-            raw.get("portfolio_value") or raw.get("equity") or raw.get("total_equity")
+            raw["portfolio_value"] if "portfolio_value" in raw else
+            raw.get("equity") or raw.get("total_equity")
         ),
         "unrealized_pnl": _cents_to_dollars(
             raw.get("unrealized_pnl") or raw.get("unrealized_pl")
@@ -54,7 +56,7 @@ def fetch_balance(api: KalshiAPI) -> Dict[str, Any]:
         "realized_pnl": _cents_to_dollars(
             raw.get("realized_pnl") or raw.get("realized_pl")
         ),
-        "timestamp": raw.get("timestamp") or raw.get("time"),
+        "timestamp": raw.get("updated_ts") or raw.get("timestamp") or raw.get("time"),
     }
 
     return {

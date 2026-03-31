@@ -67,3 +67,6 @@ yarn-error.log*
 *.tmp
 *.temp
 bot_settings.json
+
+# Secrets
+*.pem

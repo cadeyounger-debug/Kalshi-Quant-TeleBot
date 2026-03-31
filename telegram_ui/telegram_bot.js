@@ -213,17 +213,18 @@ Use the inline keyboard below for quick access to common functions.
     async handleStatusCommand(chatId) {
         try {
             const status = await this.getBotStatus();
+            const strategies = status.active_strategies || status.activeStrategies || [];
             const statusMessage = `
 🤖 *Bot Status*
 
 *Trading Status:* ${status.trading ? '🟢 Active' : '🔴 Inactive'}
-*Last Update:* ${status.lastUpdate}
-*Uptime:* ${status.uptime}
+*Last Update:* ${status.lastUpdate || new Date().toLocaleString()}
+*Uptime:* ${status.uptime || 'N/A'}
 *API Connection:* ${status.apiConnected ? '🟢 Connected' : '🔴 Disconnected'}
-*Active Strategies:* ${status.activeStrategies.join(', ')}
-*Total Trades Today:* ${status.tradesCount}
+*Active Strategies:* ${strategies.join(', ') || 'None'}
+*Positions:* ${status.positionsCount || 0}
             `;
-            
+
             this.bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
         } catch (error) {
             this.bot.sendMessage(chatId, `❌ Error fetching status: ${error.message}`);
@@ -257,15 +258,19 @@ Use the inline keyboard below for quick access to common functions.
     async handleBalanceCommand(chatId) {
         try {
             const balance = await this.getAccountBalance();
+            const available = balance.available ?? 0;
+            const equity = balance.total_equity ?? balance.totalEquity ?? 0;
+            const unrealized = balance.unrealized_pnl ?? balance.unrealizedPnL ?? 0;
+            const realized = balance.realized_pnl ?? balance.realizedPnL ?? 0;
             const balanceMessage = `
 💰 *Account Balance*
 
-*Available Balance:* $${balance.available.toFixed(2)}
-*Total Equity:* $${balance.totalEquity.toFixed(2)}
-*Unrealized P&L:* ${balance.unrealizedPnL >= 0 ? '🟢' : '🔴'} $${balance.unrealizedPnL.toFixed(2)}
-*Today's P&L:* ${balance.todayPnL >= 0 ? '🟢' : '🔴'} $${balance.todayPnL.toFixed(2)}
+*Available Balance:* $${Number(available).toFixed(2)}
+*Total Equity:* $${Number(equity).toFixed(2)}
+*Unrealized P&L:* ${unrealized >= 0 ? '🟢' : '🔴'} $${Number(unrealized).toFixed(2)}
+*Realized P&L:* ${realized >= 0 ? '🟢' : '🔴'} $${Number(realized).toFixed(2)}
             `;
-            
+
             this.bot.sendMessage(chatId, balanceMessage, { parse_mode: 'Markdown' });
         } catch (error) {
             this.bot.sendMessage(chatId, `❌ Error fetching balance: ${error.message}`);
