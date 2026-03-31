@@ -361,6 +361,16 @@ class BotInterface {
             env,
         });
 
+        this.pythonProcess.on('error', (err) => {
+            console.error('Failed to start Python bot:', err.message);
+            this.pythonProcess = null;
+            this.broadcastToClients({
+                type: 'bot_error',
+                data: `Failed to start Python bot: ${err.message}`,
+                timestamp: new Date().toISOString()
+            });
+        });
+
         this.pythonProcess.stdout.on('data', (data) => {
             const output = data.toString();
             console.log('Python bot output:', output);
@@ -462,11 +472,16 @@ class BotInterface {
             const script = this.botStateScript;
             const args = [script, command];
 
-            const child = spawn('python3', args, {
-                cwd: path.dirname(script),
-                stdio: ['pipe', 'pipe', 'pipe'],
-                env: this.buildPythonEnv()
-            });
+            let child;
+            try {
+                child = spawn('python3', args, {
+                    cwd: path.dirname(script),
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                    env: this.buildPythonEnv()
+                });
+            } catch (err) {
+                return reject(new Error(`Failed to spawn python3: ${err.message}`));
+            }
 
             let stdout = '';
             let stderr = '';

@@ -1,7 +1,8 @@
 FROM node:22-slim
 
 # Install Python
-RUN apt-get update && apt-get install -y python3 python3-pip python3-venv bash && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y python3 python3-pip python3-venv bash && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python3
 
 WORKDIR /app
 
