@@ -1,8 +1,6 @@
 [build]
-builder = "NIXPACKS"
-nixpacks = { providers = ["python", "node"] }
-buildCommand = "pip3 install -r requirements.txt && cd telegram_ui && npm install"
-startCommand = "bash start.sh"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 restartPolicyType = "ON_FAILURE"
