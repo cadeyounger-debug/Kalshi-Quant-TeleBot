@@ -1,7 +1,7 @@
 FROM node:22-slim
 
 # Install Python
-RUN apt-get update && apt-get install -y python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y python3 python3-pip python3-venv bash && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -17,4 +17,6 @@ RUN cd telegram_ui && npm install
 COPY . .
 
 # Start both services
-CMD ["bash", "start.sh"]
+RUN chmod +x start.sh
+
+CMD ["/bin/bash", "start.sh"]
