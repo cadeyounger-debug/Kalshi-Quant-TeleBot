@@ -1,16 +1,15 @@
 #!/bin/bash
-# Start both the bot interface (Express API) and the Telegram bot
-cd telegram_ui
+set -e
 
 # Start bot interface in background
-node bot_interface.js &
+node /app/telegram_ui/bot_interface.js &
 BOT_INTERFACE_PID=$!
 
 # Wait for interface to be ready
 sleep 2
 
-# Start Telegram bot in foreground (keeps container alive)
-node telegram_bot.js &
+# Start Telegram bot in background
+node /app/telegram_ui/telegram_bot.js &
 TELEGRAM_PID=$!
 
 # Wait for either to exit
