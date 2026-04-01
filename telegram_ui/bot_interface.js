@@ -277,7 +277,6 @@ class BotInterface {
                 });
             }
         });
-    }
 
         // Database stats endpoint
         this.app.get('/api/dbstats', async (req, res) => {
