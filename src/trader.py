@@ -13,6 +13,38 @@ from performance_analytics import PerformanceAnalytics, Trade
 from settings_manager import SettingsManager
 from db import TradingDB
 
+def _get_market_price_cents(market: Dict[str, Any]) -> float:
+    """Extract market price in cents from Kalshi v2 market data.
+
+    Kalshi v2 returns prices as dollar strings (e.g. "0.5000" = 50 cents).
+    Falls back to legacy fields for compatibility.
+    Returns price in cents (1-99) or 0 if unavailable.
+    """
+    # Kalshi v2: dollar string fields
+    for field in ('yes_ask_dollars', 'yes_bid_dollars', 'no_bid_dollars'):
+        val = market.get(field)
+        if val is not None:
+            try:
+                dollars = float(val)
+                if dollars > 0:
+                    return round(dollars * 100)  # Convert to cents
+            except (ValueError, TypeError):
+                continue
+
+    # Legacy / streamer fields (already in cents or 0-1 range)
+    for field in ('yes_ask', 'last_price', 'current_price'):
+        val = market.get(field)
+        if val is not None:
+            try:
+                v = float(val)
+                if v > 0:
+                    return v if v > 1 else round(v * 100)
+            except (ValueError, TypeError):
+                continue
+
+    return 0
+
+
 class Trader:
     def __init__(self, api, notifier, logger, bankroll):
         self.api = api
@@ -118,7 +150,7 @@ class Trader:
                     if market_data and 'markets' in market_data and market_data['markets']:
                         market = self._pick_best_market(market_data['markets'], sentiment_decision['direction'])
                         event_id = market.get('ticker') or market.get('id')
-                        current_price = market.get('yes_ask') or market.get('last_price') or market.get('current_price')
+                        current_price = _get_market_price_cents(market)
 
                         if event_id and current_price:
                             action = 'buy' if sentiment_decision['direction'] == 'long' else 'sell'
@@ -201,7 +233,7 @@ class Trader:
                     market = volatility_decision.get('market')
                     if market:
                         event_id = market.get('ticker') or market.get('id')
-                        current_price = market.get('yes_ask') or market.get('last_price') or market.get('current_price')
+                        current_price = _get_market_price_cents(market)
 
                         if event_id and current_price and volatility_decision.get('direction'):
                             action = 'buy' if volatility_decision['direction'] == 'long' else 'sell'
@@ -364,7 +396,7 @@ class Trader:
             enriched.append({
                 "id": mid,
                 "title": m.get("title", ""),
-                "current_price": m.get("yes_ask") or m.get("last_price") or 0,
+                "current_price": _get_market_price_cents(m),
                 "price_history": history,
             })
         return self.arbitrage_analyzer.find_arbitrage_opportunities(enriched)
@@ -382,7 +414,7 @@ class Trader:
             vol_analysis = self.volatility_analyzer.analyze_market_volatility({
                 "id": mid,
                 "title": m.get("title", ""),
-                "current_price": m.get("yes_ask") or m.get("last_price") or 0,
+                "current_price": _get_market_price_cents(m),
                 "price_history": history,
             })
             decision = self.volatility_analyzer.should_trade_based_on_volatility(vol_analysis)
@@ -420,12 +452,12 @@ class Trader:
             if not ticker or ticker in self.current_positions:
                 continue
 
-            yes_price = m.get('yes_ask') or m.get('last_price')
+            yes_price = _get_market_price_cents(m)
             if not yes_price or yes_price <= 0:
                 continue
 
-            # Normalize to 0-1 range if in cents
-            price = yes_price / 100 if yes_price > 1 else yes_price
+            # Normalize to 0-1 range (yes_price is in cents)
+            price = yes_price / 100
 
             # We want markets with strong consensus (price far from 0.50)
             distance_from_center = abs(price - 0.50)
@@ -476,14 +508,15 @@ class Trader:
         """Pick the market with the most upside for the given direction."""
         scored = []
         for m in markets:
-            price = m.get('yes_ask') or m.get('last_price') or m.get('current_price')
+            price = _get_market_price_cents(m)
             if not price or price <= 0:
                 continue
             # For a long bet we want cheap yes contracts; for short, expensive ones
+            price_frac = price / 100
             if direction == 'long':
-                score = 1.0 - (price / 100 if price > 1 else price)
+                score = 1.0 - price_frac
             else:
-                score = price / 100 if price > 1 else price
+                score = price_frac
             scored.append((score, m))
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[0][1] if scored else markets[0]
