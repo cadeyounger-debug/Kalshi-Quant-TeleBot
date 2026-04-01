@@ -253,31 +253,12 @@ class Trader:
                 tickers.append(f"KX{coin}MAXMON-{code}-{dt}")
                 tickers.append(f"KX{coin}MINMON-{code}-{dt}")
 
-        # Daily price events for next 7 days
-        for days_ahead in range(0, 7):
+        # Daily price events for next 3 days
+        for days_ahead in range(0, 3):
             d = now + timedelta(days=days_ahead)
             ds = d.strftime("%y%b%d").upper()
             for coin in ["KXBTC", "KXETH", "KXSOL"]:
                 tickers.append(f"{coin}-{ds}0100")
-
-        # Hourly (1H) events for next 12 hours
-        for hours_ahead in range(0, 12):
-            t = now + timedelta(hours=hours_ahead)
-            ds = t.strftime("%y%b%d").upper()
-            h = t.hour
-            for coin in ["KXBTC1H", "KXETH1H", "KXSOL1H"]:
-                tickers.append(f"{coin}-{ds}{h:02d}00")
-
-        # 15-minute events for next 2 hours
-        for mins_ahead in range(0, 120, 15):
-            t = now + timedelta(minutes=mins_ahead)
-            ds = t.strftime("%y%b%d").upper()
-            hm = t.strftime("%H%M")
-            # Round to nearest 15
-            m15 = (t.minute // 15) * 15
-            hm = f"{t.hour:02d}{m15:02d}"
-            for coin in ["KXBTC15M", "KXETH15M", "KXSOL15M"]:
-                tickers.append(f"{coin}-{ds}{hm}")
 
         # Deduplicate
         return list(dict.fromkeys(tickers))
@@ -305,6 +286,7 @@ class Trader:
                 for m in resp["markets"]:
                     if m.get("status") == "active" and m.get("yes_bid_dollars", "0.0000") != "0.0000":
                         all_markets.append(m)
+            time.sleep(0.15)  # Rate limit: ~6 requests/sec
 
         self._market_cache = all_markets
         self.logger.info(f"Fetched {len(all_markets)} active BTC/ETH/SOL markets with liquidity")

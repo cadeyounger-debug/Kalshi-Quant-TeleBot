@@ -41,6 +41,8 @@ class KalshiAPI:
         # First try KALSHI_PRIVATE_KEY env var (for Railway/cloud deploys)
         pem_str = os.environ.get("KALSHI_PRIVATE_KEY")
         if pem_str:
+            # Railway may escape newlines as literal \n — restore them
+            pem_str = pem_str.replace("\\n", "\n")
             try:
                 return serialization.load_pem_private_key(pem_str.encode(), password=None)
             except Exception as e:
