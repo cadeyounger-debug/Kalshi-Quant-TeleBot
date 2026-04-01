@@ -353,10 +353,12 @@ class BotInterface {
             return;
         }
 
-        console.log('Starting Python bot...');
+        const resolvedPath = path.resolve(this.pythonBotPath);
+        const cwd = path.dirname(resolvedPath);
+        console.log(`Starting Python bot: python3 ${resolvedPath} (cwd: ${cwd})`);
         const env = this.buildPythonEnv();
-        this.pythonProcess = spawn('python3', [this.pythonBotPath], {
-            cwd: path.dirname(this.pythonBotPath),
+        this.pythonProcess = spawn('python3', [resolvedPath], {
+            cwd,
             stdio: ['pipe', 'pipe', 'pipe'],
             env,
         });
