@@ -81,6 +81,11 @@ Use the inline keyboard below for quick access to common functions.
             this.handleBalanceCommand(msg.chat.id);
         });
 
+        // Database stats command
+        this.bot.onText(/\/dbstats/, (msg) => {
+            this.handleDbStatsCommand(msg.chat.id);
+        });
+
         // Start trading command
         this.bot.onText(/\/start_trading/, (msg) => {
             this.handleStartTradingCommand(msg.chat.id);
@@ -274,6 +279,28 @@ Use the inline keyboard below for quick access to common functions.
             this.bot.sendMessage(chatId, balanceMessage, { parse_mode: 'Markdown' });
         } catch (error) {
             this.bot.sendMessage(chatId, `❌ Error fetching balance: ${error.message}`);
+        }
+    }
+
+    async handleDbStatsCommand(chatId) {
+        try {
+            const response = await axios.get(`${this.interfaceBaseUrl}/api/dbstats`);
+            const s = response.data;
+            const msg = `
+🗄️ *Database Stats*
+
+*Market Snapshots:* ${s.total_snapshots || 0}
+  BTC: ${s.btc_snapshots || 0}
+  ETH: ${s.eth_snapshots || 0}
+  SOL: ${s.sol_snapshots || 0}
+
+*Sentiment Records:* ${s.total_sentiment || 0}
+*Trade Decisions:* ${s.total_decisions || 0}
+*Trades Executed:* ${s.total_trades || 0}
+            `;
+            this.bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+        } catch (error) {
+            this.bot.sendMessage(chatId, `❌ Error fetching db stats: ${error.message}`);
         }
     }
 

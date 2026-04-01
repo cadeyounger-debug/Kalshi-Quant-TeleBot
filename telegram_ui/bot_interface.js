@@ -279,6 +279,17 @@ class BotInterface {
         });
     }
 
+        // Database stats endpoint
+        this.app.get('/api/dbstats', async (req, res) => {
+            try {
+                const stats = await this.runBotStateCommand('dbstats');
+                res.json(stats);
+            } catch (error) {
+                res.status(500).json({ success: false, error: error.message });
+            }
+        });
+    }
+
     setupWebSocket() {
         this.server = this.app.listen(this.port, '0.0.0.0', () => {
             console.log(`Bot interface server running on port ${this.port}`);

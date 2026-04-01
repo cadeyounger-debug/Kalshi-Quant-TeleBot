@@ -166,6 +166,25 @@ def fetch_settings_info() -> Dict[str, Any]:
     return settings_manager.get_setting_info()
 
 
+def fetch_dbstats() -> Dict[str, Any]:
+    """Get database statistics."""
+    try:
+        from db import TradingDB
+        db = TradingDB()
+        return {
+            "total_snapshots": len(db.get_snapshots(limit=100000)),
+            "btc_snapshots": len(db.get_snapshots(asset="BTC", limit=100000)),
+            "eth_snapshots": len(db.get_snapshots(asset="ETH", limit=100000)),
+            "sol_snapshots": len(db.get_snapshots(asset="SOL", limit=100000)),
+            "total_sentiment": len(db.get_sentiment(limit=100000)),
+            "total_decisions": len(db.get_decisions(limit=100000)),
+            "total_trades": len(db.get_trades(limit=100000)),
+            "db_path": db._db_path,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def run(command: str, data: Dict[str, Any] = None) -> Dict[str, Any]:
     api = KalshiAPI()
 
@@ -188,6 +207,9 @@ def run(command: str, data: Dict[str, Any] = None) -> Dict[str, Any]:
     if command == "settings_info":
         return fetch_settings_info()
 
+    if command == "dbstats":
+        return fetch_dbstats()
+
     raise ValueError(f"Unsupported command: {command}")
 
 
@@ -195,7 +217,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Expose bot state via CLI")
     parser.add_argument(
         "command",
-        choices=["status", "positions", "balance", "performance", "settings", "update_settings", "reset_settings", "settings_info"],
+        choices=["status", "positions", "balance", "performance", "settings", "update_settings", "reset_settings", "settings_info", "dbstats"],
         help="State command to execute",
     )
     parser.add_argument(
