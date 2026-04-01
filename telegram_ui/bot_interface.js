@@ -353,11 +353,11 @@ class BotInterface {
             return;
         }
 
-        const resolvedPath = path.resolve(this.pythonBotPath);
+        const resolvedPath = path.resolve(__dirname, this.pythonBotPath);
         const cwd = path.dirname(resolvedPath);
         console.log(`Starting Python bot: python3 ${resolvedPath} (cwd: ${cwd})`);
         const env = this.buildPythonEnv();
-        this.pythonProcess = spawn('python3', [resolvedPath], {
+        this.pythonProcess = spawn('/usr/bin/python3', [resolvedPath], {
             cwd,
             stdio: ['pipe', 'pipe', 'pipe'],
             env,
@@ -476,7 +476,7 @@ class BotInterface {
 
             let child;
             try {
-                child = spawn('python3', args, {
+                child = spawn('/usr/bin/python3', args, {
                     cwd: path.dirname(script),
                     stdio: ['pipe', 'pipe', 'pipe'],
                     env: this.buildPythonEnv()
@@ -522,7 +522,7 @@ class BotInterface {
             const jsonData = JSON.stringify(data);
             const args = [script, command, '--data', jsonData];
 
-            const child = spawn('python3', args, {
+            const child = spawn('/usr/bin/python3', args, {
                 cwd: path.dirname(script),
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env: this.buildPythonEnv()
