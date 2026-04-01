@@ -39,9 +39,17 @@ class KalshiAPI:
 
     def _load_private_key(self, path):
         # First try KALSHI_PRIVATE_KEY env var (for Railway/cloud deploys)
+        # Try base64-encoded key first (KALSHI_PRIVATE_KEY_B64), then raw PEM
+        pem_b64 = os.environ.get("KALSHI_PRIVATE_KEY_B64")
+        if pem_b64:
+            try:
+                import base64
+                pem_bytes = base64.b64decode(pem_b64)
+                return serialization.load_pem_private_key(pem_bytes, password=None)
+            except Exception as e:
+                self.logger.error(f"Failed to load private key from B64 env var: {e}")
         pem_str = os.environ.get("KALSHI_PRIVATE_KEY")
         if pem_str:
-            # Railway may escape newlines as literal \n — restore them
             pem_str = pem_str.replace("\\n", "\n")
             try:
                 return serialization.load_pem_private_key(pem_str.encode(), password=None)
