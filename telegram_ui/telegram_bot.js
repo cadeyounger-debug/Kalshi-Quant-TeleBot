@@ -10,16 +10,32 @@ class KalshiTelegramBot {
         this.pythonBotPath = pythonBotPath;
         this.authorizedUsers = new Set(); // Store authorized user IDs
         this.awaitingApiKeyChats = new Set();
+        this.alertChatIds = new Set(); // Chat IDs that receive trade/crash alerts
         this.interfaceBaseUrl = process.env.BOT_INTERFACE_URL || 'http://localhost:3001';
         this.setupCommands();
         this.setupCallbacks();
         this.setupApiKeyCapture();
     }
 
+    // Send alert to all registered chat IDs
+    sendAlert(message) {
+        for (const chatId of this.alertChatIds) {
+            this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' }).catch(() => {});
+        }
+    }
+
     setupCommands() {
         // Start command
         this.bot.onText(/\/start/, (msg) => {
             const chatId = msg.chat.id;
+            this.alertChatIds.add(chatId);
+            // Save chat ID to file so Python notifier can use it
+            const fs = require('fs');
+            try {
+                fs.mkdirSync('/app/data', { recursive: true });
+            } catch(e) {}
+            fs.writeFileSync('/app/data/chat_id.txt', String(chatId));
+            console.log(`Registered chat ${chatId} for alerts`);
             const welcomeMessage = `
 🤖 *Kalshi Trading Bot Control Panel*
 
@@ -68,6 +84,7 @@ Use the inline keyboard below for quick access to common functions.
 
         // Status command
         this.bot.onText(/\/status/, (msg) => {
+            this.alertChatIds.add(msg.chat.id);
             this.handleStatusCommand(msg.chat.id);
         });
 
@@ -306,10 +323,53 @@ Use the inline keyboard below for quick access to common functions.
 
     async handleStartTradingCommand(chatId) {
         try {
+            this.alertChatIds.add(chatId);
             await this.startTrading();
             this.bot.sendMessage(chatId, '▶️ Trading started successfully!');
+            this.startMonitoring();
         } catch (error) {
             this.bot.sendMessage(chatId, `❌ Error starting trading: ${error.message}`);
+        }
+    }
+
+    startMonitoring() {
+        // Connect to bot interface WebSocket for crash/trade events
+        if (this._ws) return; // Already monitoring
+        try {
+            const wsUrl = this.interfaceBaseUrl.replace('http', 'ws');
+            const WebSocket = require('ws');
+            this._ws = new WebSocket(wsUrl);
+
+            this._ws.on('message', (raw) => {
+                try {
+                    const msg = JSON.parse(raw);
+                    if (msg.type === 'bot_stopped') {
+                        this.sendAlert(`🚨 *ALERT: Trading bot crashed!*\nExit code: ${msg.code}\nTime: ${msg.timestamp}`);
+                        this._ws = null;
+                    }
+                    if (msg.type === 'bot_error' && msg.data && msg.data.includes('ORDER PLACED')) {
+                        this.sendAlert(`🔔 *Trade Executed*\n${msg.data}`);
+                    }
+                    if (msg.type === 'bot_output' && msg.data && msg.data.includes('ORDER PLACED')) {
+                        this.sendAlert(`🔔 *Trade Executed*\n${msg.data}`);
+                    }
+                    if (msg.type === 'bot_output' && msg.data && msg.data.includes('Closed position')) {
+                        this.sendAlert(`🔔 *Position Closed*\n${msg.data}`);
+                    }
+                } catch (e) {}
+            });
+
+            this._ws.on('close', () => {
+                this._ws = null;
+                // Reconnect after 5 seconds
+                setTimeout(() => this.startMonitoring(), 5000);
+            });
+
+            this._ws.on('error', () => {
+                this._ws = null;
+            });
+        } catch (e) {
+            console.error('Failed to start monitoring:', e.message);
         }
     }
 

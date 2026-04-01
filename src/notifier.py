@@ -6,6 +6,13 @@ class Notifier:
     def __init__(self, bot_token=None, chat_id=None):
         self.bot_token = bot_token or TELEGRAM_BOT_TOKEN
         self.chat_id = chat_id or TELEGRAM_CHAT_ID
+        # Try to read chat ID from file if not configured
+        if not self.chat_id or self.chat_id == "your_chat_id":
+            try:
+                with open("/app/data/chat_id.txt") as f:
+                    self.chat_id = f.read().strip()
+            except Exception:
+                pass
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         logging.basicConfig(level=logging.INFO)
 

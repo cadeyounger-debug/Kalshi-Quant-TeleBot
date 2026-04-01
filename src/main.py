@@ -31,10 +31,11 @@ def main():
 
     except KeyboardInterrupt:
         logger.info("Bot shutdown requested by user")
+        notifier.send_message("⚠️ Trading bot shutting down (user requested)")
         trader.market_data_streamer.stop_streaming()
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        notifier.send_error_notification(str(e))
+        notifier.send_error_notification(f"🚨 Bot crashed: {str(e)}")
         trader.market_data_streamer.stop_streaming()
         raise
     finally:
