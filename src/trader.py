@@ -11,6 +11,7 @@ from risk_manager import RiskManager
 from market_data_streamer import MarketDataStreamer
 from performance_analytics import PerformanceAnalytics, Trade
 from settings_manager import SettingsManager
+from db import TradingDB
 
 class Trader:
     def __init__(self, api, notifier, logger, bankroll):
@@ -23,6 +24,7 @@ class Trader:
         self.arbitrage_analyzer = StatisticalArbitrageAnalyzer(min_history_points=20)
         self.volatility_analyzer = VolatilityAnalyzer(min_history_points=20)
         self.risk_manager = RiskManager(bankroll)
+        self.db = TradingDB()
 
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
@@ -92,6 +94,17 @@ class Trader:
         if settings.news_sentiment_enabled:
             try:
                 sentiment_analysis = self.news_analyzer.get_market_relevant_news()
+                # Record sentiment to db for each crypto asset
+                for asset in ["BTC", "ETH", "SOL"]:
+                    self.db.record_news_sentiment(
+                        asset,
+                        overall_sentiment=sentiment_analysis.get("overall_sentiment", 0),
+                        confidence=sentiment_analysis.get("confidence", 0),
+                        article_count=sentiment_analysis.get("article_count", 0),
+                        positive_count=sentiment_analysis.get("positive_articles", 0),
+                        negative_count=sentiment_analysis.get("negative_articles", 0),
+                        neutral_count=sentiment_analysis.get("neutral_articles", 0),
+                    )
                 sentiment_decision = self.news_analyzer.should_trade_based_on_sentiment(
                     sentiment_analysis, settings.news_sentiment_threshold
                 )
@@ -215,6 +228,17 @@ class Trader:
             except Exception as e:
                 self.logger.error(f"Error in volatility analysis: {e}")
 
+        # Record decision to db
+        if trade_decision:
+            self.db.record_trade_decision(
+                trade_decision.get("event_id", ""),
+                strategy=trade_decision.get("strategy", ""),
+                direction=trade_decision.get("action", ""),
+                confidence=trade_decision.get("confidence", 0),
+                sentiment_score=trade_decision.get("sentiment_score"),
+                should_trade=True,
+            )
+
         return trade_decision
 
     def _build_crypto_event_tickers(self):
@@ -299,6 +323,17 @@ class Trader:
             if not markets:
                 self.logger.info("No markets returned from API")
                 return
+
+            # Record market snapshots to db
+            for m in markets:
+                ticker = m.get("ticker", "")
+                self.db.record_market_snapshot(
+                    ticker,
+                    title=m.get("title", ""),
+                    yes_bid=float(m.get("yes_bid_dollars", 0) or 0),
+                    yes_ask=float(m.get("yes_ask_dollars", 0) or 0),
+                    volume=float(m.get("volume_24h_fp", 0) or 0),
+                )
 
             market_data = {"markets": markets}
             trade_decision = self._make_trade_decision(market_data)
@@ -412,8 +447,20 @@ class Trader:
             result = self.api.create_order(order_payload)
             if result:
                 self.logger.info(f"ORDER PLACED: {result}")
+                self.db.record_trade(
+                    event_id,
+                    side=side,
+                    quantity=quantity,
+                    price=price_cents,
+                    strategy=strategy,
+                    order_result=str(result),
+                )
             else:
                 self.logger.error(f"Order failed for {event_id}")
+                self.db.record_trade(
+                    event_id, side=side, quantity=quantity, price=price_cents,
+                    strategy=strategy, order_result="FAILED",
+                )
                 return
 
             # Record trade in performance analytics

@@ -17,6 +17,9 @@ RUN cd telegram_ui && npm install
 # Copy app code
 COPY . .
 
+# Create data directory for SQLite
+RUN mkdir -p /app/data
+
 # Start both services
 RUN chmod +x start.sh
 
