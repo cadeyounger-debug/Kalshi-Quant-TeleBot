@@ -279,7 +279,15 @@ Use the inline keyboard below for quick access to common functions.
 
     async handleBalanceCommand(chatId) {
         try {
-            const balance = await this.getAccountBalance();
+            const response = await axios.get(`${this.interfaceBaseUrl}/api/balance`);
+            const data = response.data;
+
+            if (data.error) {
+                this.bot.sendMessage(chatId, `❌ *Balance Error*\n\n${data.error}`, { parse_mode: 'Markdown' });
+                return;
+            }
+
+            const balance = data.summary || {};
             const available = balance.available ?? 0;
             const equity = balance.total_equity ?? balance.totalEquity ?? 0;
             const unrealized = balance.unrealized_pnl ?? balance.unrealizedPnL ?? 0;

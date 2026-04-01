@@ -21,8 +21,8 @@ class Trader:
         self.bankroll = bankroll
         self.current_positions = {}
         self.news_analyzer = NewsSentimentAnalyzer()
-        self.arbitrage_analyzer = StatisticalArbitrageAnalyzer(min_history_points=20)
-        self.volatility_analyzer = VolatilityAnalyzer(min_history_points=20)
+        self.arbitrage_analyzer = StatisticalArbitrageAnalyzer(min_history_points=5)
+        self.volatility_analyzer = VolatilityAnalyzer(min_history_points=5)
         self.risk_manager = RiskManager(bankroll)
         self.db = TradingDB()
 
@@ -228,6 +228,14 @@ class Trader:
             except Exception as e:
                 self.logger.error(f"Error in volatility analysis: {e}")
 
+        # Strategy 4: Value betting fallback — make small bets to generate data
+        # Fires when all other strategies produce no signal
+        if not trade_decision:
+            try:
+                trade_decision = self._value_bet_fallback(market_data)
+            except Exception as e:
+                self.logger.error(f"Error in value bet fallback: {e}")
+
         # Record decision to db
         if trade_decision:
             self.db.record_trade_decision(
@@ -369,7 +377,7 @@ class Trader:
             mid = m.get("ticker") or m.get("id")
             streamer_data = self.market_data_streamer.get_market_data(mid)
             history = streamer_data.price_history if streamer_data else []
-            if len(history) < 20:
+            if len(history) < 5:
                 continue
             vol_analysis = self.volatility_analyzer.analyze_market_volatility({
                 "id": mid,
@@ -383,6 +391,86 @@ class Trader:
                     best = decision
                     best["market"] = m
         return best
+
+    def _value_bet_fallback(self, market_data):
+        """
+        Fallback strategy: place minimum-size bets on markets with extreme prices.
+
+        Markets priced near extremes (< 20¢ or > 80¢) reflect strong consensus.
+        We bet WITH the consensus using 1-contract minimum bets to generate
+        outcome data for model training.
+        """
+        markets = market_data.get("markets", [])
+        if not markets:
+            return None
+
+        # Don't stack too many fallback positions
+        fallback_positions = sum(
+            1 for p in self.current_positions.values()
+            if p.get('strategy') == 'value_bet'
+        )
+        if fallback_positions >= 3:
+            self.logger.info("Value bet fallback: already at 3 positions, skipping")
+            return None
+
+        # Score markets by how extreme their price is (closer to 0 or 100 = stronger signal)
+        candidates = []
+        for m in markets:
+            ticker = m.get('ticker') or m.get('id')
+            if not ticker or ticker in self.current_positions:
+                continue
+
+            yes_price = m.get('yes_ask') or m.get('last_price')
+            if not yes_price or yes_price <= 0:
+                continue
+
+            # Normalize to 0-1 range if in cents
+            price = yes_price / 100 if yes_price > 1 else yes_price
+
+            # We want markets with strong consensus (price far from 0.50)
+            distance_from_center = abs(price - 0.50)
+            if distance_from_center < 0.15:
+                continue  # Skip markets near 50/50, no edge
+
+            # Bet YES on cheap contracts (< 30¢), NO on expensive ones (> 70¢)
+            if price < 0.30:
+                direction = 'long'
+                edge = 0.30 - price  # How much below 30¢
+            elif price > 0.70:
+                direction = 'short'
+                edge = price - 0.70  # How much above 70¢
+            else:
+                continue
+
+            candidates.append({
+                'market': m,
+                'ticker': ticker,
+                'price': yes_price,
+                'direction': direction,
+                'edge': edge,
+            })
+
+        if not candidates:
+            self.logger.info("Value bet fallback: no extreme-priced markets found")
+            return None
+
+        # Pick the market with the strongest signal (most extreme price)
+        candidates.sort(key=lambda c: c['edge'], reverse=True)
+        best = candidates[0]
+
+        action = 'buy' if best['direction'] == 'long' else 'sell'
+
+        self.logger.info(f"Value bet fallback: {action} 1 unit of {best['ticker']} "
+                        f"at {best['price']}¢ (edge: {best['edge']:.2f})")
+
+        return {
+            'event_id': best['ticker'],
+            'action': action,
+            'quantity': 1,  # Minimum bet — we're here to generate data
+            'price': best['price'],
+            'strategy': 'value_bet',
+            'confidence': 0.5 + best['edge'],  # Simple confidence from price distance
+        }
 
     def _pick_best_market(self, markets, direction):
         """Pick the market with the most upside for the given direction."""

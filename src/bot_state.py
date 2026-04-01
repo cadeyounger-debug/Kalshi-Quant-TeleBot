@@ -37,7 +37,20 @@ def _cents_to_dollars(value: Any) -> float | None:
 
 
 def fetch_balance(api: KalshiAPI) -> Dict[str, Any]:
-    raw = api.get_account_balance() or {}
+    raw = api.get_account_balance()
+
+    if raw is None:
+        return {
+            "summary": {
+                "available": None,
+                "total_equity": None,
+                "unrealized_pnl": None,
+                "realized_pnl": None,
+                "timestamp": None,
+            },
+            "raw": {},
+            "error": "Kalshi API returned no data — check KALSHI_API_KEY and KALSHI_PRIVATE_KEY env vars",
+        }
 
     summary = {
         "available": _cents_to_dollars(

@@ -16,7 +16,7 @@ BANKROLL = 1000
 RISK_FACTOR = 1.0
 VOLATILITY_PENALTY = True
 MIN_DATA_POINTS = 10
-TRADE_INTERVAL_SECONDS = 300
+TRADE_INTERVAL_SECONDS = 60
 
 # Logging configuration
 LOG_FILE_PATH = "trading_bot.log"
@@ -31,9 +31,9 @@ ENABLE_NOTIFICATIONS = True
 NOTIFICATION_THRESHOLD = 0.05  # Notify if profit/loss exceeds this percentage
 
 # Advanced Strategy Parameters
-NEWS_SENTIMENT_THRESHOLD = 0.6  # Threshold for positive sentiment to trigger a trade
-STAT_ARBITRAGE_THRESHOLD = 0.05 # Price deviation for statistical arbitrage
-VOLATILITY_THRESHOLD = 0.1     # Volatility threshold for trading
+NEWS_SENTIMENT_THRESHOLD = 0.3  # Lowered to generate trade data
+STAT_ARBITRAGE_THRESHOLD = 0.03 # Lowered - price deviation for statistical arbitrage
+VOLATILITY_THRESHOLD = 0.05     # Lowered - volatility threshold for trading
 
 # Risk Management Parameters
 MAX_POSITION_SIZE_PERCENTAGE = 0.10 # Max percentage of bankroll to commit to a single trade

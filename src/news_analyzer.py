@@ -19,6 +19,12 @@ class NewsSentimentAnalyzer:
         self.base_url = NEWS_API_BASE_URL
         self.session = requests.Session()
 
+        # News API rate limit protection
+        self._cached_articles = []
+        self._cache_timestamp = None
+        self._cache_ttl_seconds = 1800  # Reuse cached results for 30 minutes
+        self._consecutive_429s = 0
+
         # Keywords focused on crypto markets
         self.keywords = [
             'bitcoin', 'BTC', 'ethereum', 'ETH', 'solana', 'SOL',
@@ -29,27 +35,33 @@ class NewsSentimentAnalyzer:
             'federal reserve', 'interest rate', 'inflation',
         ]
 
+    def _cache_is_fresh(self) -> bool:
+        """Check if cached articles are still usable."""
+        if not self._cache_timestamp or not self._cached_articles:
+            return False
+        age = (datetime.now() - self._cache_timestamp).total_seconds()
+        return age < self._cache_ttl_seconds
+
     def fetch_news(self, query: str = None, days_back: int = 1) -> List[Dict[str, Any]]:
         """
-        Fetch news articles from NewsAPI.
+        Fetch news articles from NewsAPI with rate-limit protection.
 
-        Args:
-            query: Search query (if None, uses default keywords)
-            days_back: Number of days to look back
-
-        Returns:
-            List of news articles with metadata
+        Uses cached results when rate-limited (429) instead of returning empty.
         """
         if not self.api_key or self.api_key == "your_news_api_key":
             logger.warning("NewsAPI key not configured, skipping news fetch")
             return []
 
-        try:
-            # Build query from keywords if none provided
-            if not query:
-                query = ' OR '.join(f'"{kw}"' for kw in self.keywords[:5])  # Limit to avoid too broad search
+        # If we've been rate-limited recently, use cache instead of hammering the API
+        if self._consecutive_429s >= 2 and self._cache_is_fresh():
+            logger.info(f"Using cached news ({len(self._cached_articles)} articles, "
+                       f"avoiding rate limit after {self._consecutive_429s} consecutive 429s)")
+            return self._cached_articles
 
-            # Calculate date range
+        try:
+            if not query:
+                query = ' OR '.join(f'"{kw}"' for kw in self.keywords[:5])
+
             from_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
 
             params = {
@@ -66,11 +78,31 @@ class NewsSentimentAnalyzer:
             data = response.json()
             articles = data.get('articles', [])
 
+            # Cache successful results
+            self._cached_articles = articles
+            self._cache_timestamp = datetime.now()
+            self._consecutive_429s = 0
+
             logger.info(f"Fetched {len(articles)} news articles")
             return articles
 
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                self._consecutive_429s += 1
+                if self._cached_articles:
+                    logger.warning(f"NewsAPI rate limited (429), using cached articles "
+                                  f"({len(self._cached_articles)} articles)")
+                    return self._cached_articles
+                else:
+                    logger.warning("NewsAPI rate limited (429) and no cached articles available")
+                    return []
+            logger.error(f"Error fetching news: {e}")
+            return []
         except Exception as e:
             logger.error(f"Error fetching news: {e}")
+            # Fall back to cache on any error
+            if self._cached_articles:
+                return self._cached_articles
             return []
 
     def analyze_sentiment(self, text: str) -> Dict[str, float]:
@@ -254,18 +286,18 @@ class NewsSentimentAnalyzer:
             'reason': ''
         }
 
-        if confidence < 0.3:  # Minimum confidence threshold
+        if confidence < 0.15:  # Minimum confidence threshold (lowered to generate data)
             decision['reason'] = f"Low confidence ({confidence:.2f}) - insufficient data"
             return decision
 
-        if sentiment > threshold and confidence > 0.5:
+        if sentiment > threshold and confidence > 0.2:
             decision['should_trade'] = True
             decision['direction'] = 'long'
-            decision['reason'] = f"Strong positive sentiment ({sentiment:.2f}) with high confidence ({confidence:.2f})"
-        elif sentiment < -threshold and confidence > 0.5:
+            decision['reason'] = f"Positive sentiment ({sentiment:.2f}) with confidence ({confidence:.2f})"
+        elif sentiment < -threshold and confidence > 0.2:
             decision['should_trade'] = True
             decision['direction'] = 'short'
-            decision['reason'] = f"Strong negative sentiment ({sentiment:.2f}) with high confidence ({confidence:.2f})"
+            decision['reason'] = f"Negative sentiment ({sentiment:.2f}) with confidence ({confidence:.2f})"
         else:
             decision['reason'] = f"Sentiment ({sentiment:.2f}) below threshold or insufficient confidence"
 

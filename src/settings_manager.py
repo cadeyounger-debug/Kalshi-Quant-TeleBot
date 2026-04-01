@@ -23,10 +23,10 @@ class BotSettings:
     max_position_size_pct: float = 0.10  # Max 10% of bankroll
     stop_loss_pct: float = 0.05  # 5% stop loss
 
-    # Strategy-specific thresholds
-    news_sentiment_threshold: float = 0.6
-    stat_arbitrage_threshold: float = 0.05
-    volatility_threshold: float = 0.1
+    # Strategy-specific thresholds (lowered to generate trade data)
+    news_sentiment_threshold: float = 0.3
+    stat_arbitrage_threshold: float = 0.03
+    volatility_threshold: float = 0.05
 
     # Trading parameters
     trade_interval_seconds: int = 60
