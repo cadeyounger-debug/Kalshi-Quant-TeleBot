@@ -24,10 +24,10 @@ class Trader:
         self.volatility_analyzer = VolatilityAnalyzer(min_history_points=20)
         self.risk_manager = RiskManager(bankroll)
 
-        # Phase 3: Enhanced market data — stream crypto markets specifically
+        # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
         self.market_data_streamer = MarketDataStreamer(
-            api, update_interval=60, event_tickers=crypto_events
+            api, update_interval=300, event_tickers=crypto_events  # Every 5 min
         )
         self.performance_analytics = PerformanceAnalytics()
 
@@ -281,12 +281,12 @@ class Trader:
         event_tickers = self._build_crypto_event_tickers()
         all_markets = []
         for event_ticker in event_tickers:
+            time.sleep(0.5)  # Rate limit: max 2 requests/sec
             resp = self.api.get_markets(params={"event_ticker": event_ticker, "limit": 200})
             if resp and resp.get("markets"):
                 for m in resp["markets"]:
                     if m.get("status") == "active" and m.get("yes_bid_dollars", "0.0000") != "0.0000":
                         all_markets.append(m)
-            time.sleep(0.15)  # Rate limit: ~6 requests/sec
 
         self._market_cache = all_markets
         self.logger.info(f"Fetched {len(all_markets)} active BTC/ETH/SOL markets with liquidity")

@@ -118,6 +118,7 @@ class MarketDataStreamer:
             all_raw_markets = []
             if self.event_tickers:
                 for event_ticker in self.event_tickers:
+                    time.sleep(0.5)  # Rate limit
                     resp = self.api_client.get_markets(params={"event_ticker": event_ticker, "limit": 200})
                     if resp and resp.get("markets"):
                         all_raw_markets.extend(resp["markets"])
