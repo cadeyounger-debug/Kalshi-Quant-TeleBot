@@ -557,17 +557,22 @@ class Trader:
             # Generate unique trade ID
             trade_id = f"{strategy}_{event_id}_{int(time.time())}"
 
-            # Build Kalshi v2 order payload — prices as cent integers
+            # Build Kalshi v2 order payload
+            # Under 3¢ → market order (instant fill), 3¢ and above → limit order
             side = 'yes' if action.lower() == 'buy' else 'no'
+            order_type = 'market' if price_cents < 3 else 'limit'
             order_payload = {
                 'ticker': event_id,
                 'action': 'buy',
                 'side': side,
                 'count': quantity,
-                'type': 'limit',
-                'yes_price': price_cents if side == 'yes' else None,
-                'no_price': price_cents if side == 'no' else None,
+                'type': order_type,
             }
+            if order_type == 'limit':
+                if side == 'yes':
+                    order_payload['yes_price'] = price_cents
+                else:
+                    order_payload['no_price'] = price_cents
             # Remove None values
             order_payload = {k: v for k, v in order_payload.items() if v is not None}
             self.logger.info(f"Order payload: {order_payload}")
