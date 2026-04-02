@@ -735,11 +735,18 @@ class Trader:
                         f"edge={best_edge:+.0f}¢ — "
                         f"BUY {best_trade['side'].upper()} at {best_trade['trade_price']}¢")
 
+        # Size up on large mispricings: 3x when edge > 30¢, 2x when > 15¢
+        quantity = 1
+        if best_edge > 30:
+            quantity = 3
+        elif best_edge > 15:
+            quantity = 2
+
         return {
             'event_id': c['ticker'],
             'action': 'buy',
             'side': best_trade['side'],
-            'quantity': 1,
+            'quantity': quantity,
             'price': best_trade['trade_price'],
             'strategy': 'value_bet',
             'confidence': p['confidence'],
