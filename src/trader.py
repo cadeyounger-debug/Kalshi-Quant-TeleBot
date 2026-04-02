@@ -21,20 +21,36 @@ import re
 def _parse_strike_from_ticker(ticker: str) -> float:
     """Extract strike/target price from Kalshi market ticker.
 
-    Kalshi crypto tickers encode the strike as a suffix like:
-      KXBTC-26APR020100-T85000  → $85,000
-      KXETH-26APR020100-T2100   → $2,100
-      KXSOL-26APR020100-T80     → $80
-    Also handles floor/ceiling patterns in monthly min/max tickers.
+    Examples:
+      KXBTC-26APR020100-T85000      → $85,000
+      KXETH-26APR020100-T2100       → $2,100
+      KXBTCMAXMON-BTC-26APR30-7250000 → $72,500 (cents → dollars)
+      KXSOLMINMON-SOL-26APR30-7500    → $75.00 (cents → dollars)
     """
-    # Match -T followed by digits at end of ticker
-    m = re.search(r'-T(\d+)$', ticker or '')
+    if not ticker:
+        return 0.0
+
+    # Match -T or -B followed by digits at end
+    m = re.search(r'-[TB](\d+\.?\d*)$', ticker)
     if m:
         return float(m.group(1))
-    # Try floor/ceiling pattern: -B followed by digits
-    m = re.search(r'-B(\d+)$', ticker or '')
+
+    # Monthly min/max tickers: last segment is pure digits (strike in cents)
+    # e.g. KXBTCMAXMON-BTC-26APR30-7250000
+    m = re.search(r'-(\d{4,})$', ticker)
     if m:
-        return float(m.group(1))
+        raw = float(m.group(1))
+        # Heuristic: BTC strikes > 10000 are in cents (divide by 100)
+        # SOL/ETH strikes < 100000 could be cents or dollars
+        # Use the asset prefix to decide
+        if 'BTC' in ticker.upper() and raw > 100000:
+            return raw / 100  # 7250000 → 72500
+        elif 'ETH' in ticker.upper() and raw > 10000:
+            return raw / 100  # 250000 → 2500
+        elif 'SOL' in ticker.upper() and raw > 1000:
+            return raw / 100  # 7500 → 75
+        return raw
+
     return 0.0
 
 def _dollar_to_cents(val) -> int:
@@ -549,10 +565,9 @@ class Trader:
         if fallback_positions >= 2:
             return None
 
-        # Find tradeable contracts — only same-day expiration
+        # Find tradeable contracts — prefer 15-min, allow monthly
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
-        end_of_day = now.replace(hour=23, minute=59, second=59)
 
         contracts_15m = []
         contracts_daily = []
@@ -565,17 +580,15 @@ class Trader:
             if not ticker or ticker in self.current_positions:
                 continue
 
-            # Only same-day contracts
+            # Skip already expired contracts
             exp_str = m.get('expected_expiration_time') or m.get('expiration_time') or ''
             if exp_str:
                 try:
                     exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
-                    if exp_dt > end_of_day:
-                        continue  # Expires after today — skip
                     if exp_dt < now:
-                        continue  # Already expired
+                        continue
                 except (ValueError, TypeError):
-                    continue  # Can't parse expiration — skip
+                    pass
 
             yes_price = _get_market_price_cents(m)
             no_price = _get_no_price_cents(m)
