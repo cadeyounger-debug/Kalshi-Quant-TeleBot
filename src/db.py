@@ -89,12 +89,21 @@ CREATE TABLE IF NOT EXISTS news_sentiment (
     timestamp           TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS crypto_prices (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset           TEXT NOT NULL,
+    price_usd       REAL NOT NULL,
+    change_24h_pct  REAL,
+    timestamp       TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_asset_ts   ON market_snapshots(asset, timestamp);
 CREATE INDEX IF NOT EXISTS idx_decisions_asset_ts   ON trade_decisions(asset, timestamp);
 CREATE INDEX IF NOT EXISTS idx_decisions_strategy    ON trade_decisions(strategy);
 CREATE INDEX IF NOT EXISTS idx_trades_asset_ts       ON trades(asset, timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy       ON trades(strategy);
 CREATE INDEX IF NOT EXISTS idx_sentiment_asset_ts    ON news_sentiment(asset, timestamp);
+CREATE INDEX IF NOT EXISTS idx_crypto_prices_asset_ts ON crypto_prices(asset, timestamp);
 """
 
 
@@ -126,6 +135,20 @@ class TradingDB:
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE market_snapshots ADD COLUMN no_bid REAL")
                 conn.execute("ALTER TABLE market_snapshots ADD COLUMN no_ask REAL")
+
+            # Migrate: create crypto_prices table if missing (for existing DBs)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS crypto_prices ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "asset TEXT NOT NULL, "
+                "price_usd REAL NOT NULL, "
+                "change_24h_pct REAL, "
+                "timestamp TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_crypto_prices_asset_ts "
+                "ON crypto_prices(asset, timestamp)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10)
@@ -235,6 +258,41 @@ class TradingDB:
                      timestamp),
                 )
                 return cur.lastrowid
+
+    def record_crypto_price(
+        self,
+        asset: str,
+        price_usd: float,
+        change_24h_pct: float = None,
+        timestamp: str = None,
+    ) -> int:
+        """Record a crypto spot price snapshot."""
+        timestamp = timestamp or _now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO crypto_prices (asset, price_usd, change_24h_pct, timestamp) "
+                    "VALUES (?, ?, ?, ?)",
+                    (asset.upper(), price_usd, change_24h_pct, timestamp),
+                )
+                return cur.lastrowid
+
+    def get_crypto_prices(
+        self,
+        asset: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Query recorded crypto price snapshots."""
+        sql, params = self._build_query(
+            "SELECT * FROM crypto_prices", asset=asset, since=since
+        )
+        sql += " LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Query methods

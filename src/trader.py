@@ -13,6 +13,7 @@ from performance_analytics import PerformanceAnalytics, Trade
 from settings_manager import SettingsManager
 from db import TradingDB
 from retrain import load_current_params, PARAMS_PATH
+from crypto_prices import get_default as get_crypto_prices
 
 def _dollar_to_cents(val) -> int:
     """Convert a dollar string like '0.5000' to cents (50)."""
@@ -75,6 +76,7 @@ class Trader:
         self.volatility_analyzer = VolatilityAnalyzer(min_history_points=5)
         self.risk_manager = RiskManager(bankroll)
         self.db = TradingDB()
+        self.crypto_prices = get_crypto_prices()
         self.model_params = load_current_params()
         self.logger.info(f"Loaded model params v{self.model_params.get('version', 0)}")
 
@@ -395,6 +397,15 @@ class Trader:
         """Main trading loop iteration: check exits, fetch markets, analyse, execute."""
         try:
             self._reload_model_params()
+
+            # Fetch and record live crypto spot prices
+            spot_prices = self.crypto_prices.get_prices()
+            for asset, data in spot_prices.items():
+                self.db.record_crypto_price(asset, data["price"], data.get("change_24h"))
+            if spot_prices:
+                spot_str = ", ".join(f"{a}: ${d['price']:,.0f} ({d.get('change_24h', 0):+.1f}%)" for a, d in spot_prices.items())
+                self.logger.info(f"Spot prices: {spot_str}")
+
             markets = self._fetch_all_markets()
             if not markets:
                 self.logger.info("No markets returned from API")
@@ -522,19 +533,45 @@ class Trader:
             else:
                 continue  # Inside dead zone — no edge
 
+            # Boost edge for contracts whose strike is near current spot price
+            # These have the most uncertainty and best risk/reward
+            from db import extract_asset
+            asset = extract_asset(ticker)
+            spot = self.crypto_prices.get_price(asset)
+            title = m.get('title', '')
+
+            spot_boost = 0
+            if spot and title:
+                # Try to extract strike price from title (e.g. "Bitcoin price range on Apr 1, 2026?")
+                import re
+                strike_match = re.search(r'[\$]?([\d,]+)', title)
+                if strike_match:
+                    try:
+                        strike = float(strike_match.group(1).replace(',', ''))
+                        # How close is the strike to current spot? (as %)
+                        distance_pct = abs(strike - spot) / spot if spot > 0 else 1
+                        if distance_pct < 0.05:  # Within 5% of spot
+                            spot_boost = 0.15
+                        elif distance_pct < 0.10:  # Within 10%
+                            spot_boost = 0.08
+                    except ValueError:
+                        pass
+
             candidates.append({
                 'market': m,
                 'ticker': ticker,
                 'price': yes_price,
                 'direction': direction,
-                'edge': edge,
+                'edge': edge + spot_boost,
+                'spot_boost': spot_boost,
+                'asset': asset,
             })
 
         if not candidates:
             self.logger.info("Value bet fallback: no extreme-priced markets found")
             return None
 
-        # Pick the market with the strongest signal (most extreme price)
+        # Pick the market with the strongest signal
         candidates.sort(key=lambda c: c['edge'], reverse=True)
         best = candidates[0]
 

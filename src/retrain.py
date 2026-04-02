@@ -436,6 +436,89 @@ def analyze_sentiment_effectiveness() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Analysis 5: Spot price vs contract price correlation
+# ---------------------------------------------------------------------------
+def analyze_spot_contract_correlation() -> Dict[str, Any]:
+    """When spot price moves, do contract prices follow?
+
+    Compares crypto_prices movements with market_snapshots movements
+    to learn how responsive Kalshi contracts are to spot moves.
+    """
+    cutoff = get_cutoff_date()
+
+    spot_prices = query_db(
+        """SELECT asset, price_usd, change_24h_pct, timestamp
+           FROM crypto_prices WHERE timestamp >= ?
+           ORDER BY asset, timestamp""",
+        (cutoff,)
+    )
+
+    if len(spot_prices) < 10:
+        logger.info(f"Only {len(spot_prices)} spot price records — skipping correlation analysis")
+        return {}
+
+    contract_snapshots = query_db(
+        """SELECT asset, AVG(yes_bid) as avg_yes_bid, timestamp
+           FROM market_snapshots WHERE timestamp >= ?
+           GROUP BY asset, substr(timestamp, 1, 16)
+           ORDER BY asset, timestamp""",
+        (cutoff,)
+    )
+
+    if len(contract_snapshots) < 10:
+        return {}
+
+    # Group by asset
+    from collections import defaultdict
+    spot_by_asset = defaultdict(list)
+    for s in spot_prices:
+        spot_by_asset[s["asset"]].append(s)
+
+    contract_by_asset = defaultdict(list)
+    for c in contract_snapshots:
+        contract_by_asset[c["asset"]].append(c)
+
+    correlations = {}
+    for asset in ["BTC", "ETH", "SOL"]:
+        spots = spot_by_asset.get(asset, [])
+        contracts = contract_by_asset.get(asset, [])
+        if len(spots) < 5 or len(contracts) < 5:
+            continue
+
+        # Compute spot price changes
+        spot_changes = []
+        for i in range(1, len(spots)):
+            prev = spots[i-1]["price_usd"]
+            curr = spots[i]["price_usd"]
+            if prev and curr and prev > 0:
+                spot_changes.append((curr - prev) / prev)
+
+        # Compute average contract price changes
+        contract_changes = []
+        for i in range(1, len(contracts)):
+            prev = contracts[i-1]["avg_yes_bid"]
+            curr = contracts[i]["avg_yes_bid"]
+            if prev and curr and prev > 0:
+                contract_changes.append((curr - prev) / prev)
+
+        # Align to same length and compute correlation
+        min_len = min(len(spot_changes), len(contract_changes))
+        if min_len >= 5:
+            sc = np.array(spot_changes[:min_len])
+            cc = np.array(contract_changes[:min_len])
+            corr = float(np.corrcoef(sc, cc)[0, 1]) if np.std(sc) > 0 and np.std(cc) > 0 else 0
+            correlations[asset] = {
+                "correlation": round(corr, 3),
+                "spot_avg_move": round(float(np.mean(np.abs(sc))), 4),
+                "contract_avg_move": round(float(np.mean(np.abs(cc))), 4),
+                "data_points": min_len,
+            }
+            logger.info(f"{asset} spot-contract correlation: {corr:.3f} ({min_len} data points)")
+
+    return {"correlations": correlations}
+
+
+# ---------------------------------------------------------------------------
 # Compute optimal params from ALL analyses
 # ---------------------------------------------------------------------------
 def compute_optimal_params(
@@ -443,6 +526,7 @@ def compute_optimal_params(
     missed_analysis: Dict,
     trade_analysis: Dict,
     sentiment_analysis: Dict,
+    spot_correlation: Dict = None,
 ) -> Dict[str, Any]:
     params = DEFAULT_PARAMS.copy()
     params["trained_at"] = datetime.now(timezone.utc).isoformat()
@@ -610,6 +694,25 @@ def compute_optimal_params(
             # This high range has downward pressure — expand NO buying
             params["buy_no_above"] = min(params["buy_no_above"], low)
 
+    # --- Learn from spot-contract correlations ---
+    if spot_correlation and spot_correlation.get("correlations"):
+        corrs = spot_correlation["correlations"]
+        # If spot price strongly correlates with contracts, boost assets where
+        # contracts lag behind spot moves (arbitrage opportunity)
+        for asset, data in corrs.items():
+            corr = data.get("correlation", 0)
+            spot_move = data.get("spot_avg_move", 0)
+            contract_move = data.get("contract_avg_move", 0)
+
+            if corr > 0.5 and spot_move > contract_move * 1.5:
+                # Spot moves faster than contracts — opportunity to front-run
+                current_weight = params["asset_weights"].get(asset, 1.0)
+                params["asset_weights"][asset] = round(min(current_weight * 1.3, 3.0), 2)
+                logger.info(f"{asset}: high spot-contract correlation ({corr:.2f}) with "
+                           f"spot leading — boosting weight to {params['asset_weights'][asset]}")
+
+        params["spot_correlations"] = {a: d["correlation"] for a, d in corrs.items()}
+
     return params
 
 
@@ -638,6 +741,9 @@ def retrain():
     logger.info("--- Analyzing sentiment effectiveness ---")
     sentiment_analysis = analyze_sentiment_effectiveness()
 
+    logger.info("--- Analyzing spot price vs contract correlation ---")
+    spot_correlation = analyze_spot_contract_correlation()
+
     # Summary
     logger.info(f"\nSummary:")
     logger.info(f"  Markets observed: {price_analysis.get('total_markets_observed', 0)}")
@@ -645,10 +751,11 @@ def retrain():
     logger.info(f"  Correct passes: {len(missed_analysis.get('correct_passes', []))}")
     logger.info(f"  Trades made: {trade_analysis.get('total_trades', 0)}")
     logger.info(f"  Sentiment accuracy: {sentiment_analysis.get('accuracy', 'N/A')}")
+    logger.info(f"  Spot correlations: {spot_correlation.get('correlations', {})}")
 
     # Compute and save
     new_params = compute_optimal_params(
-        price_analysis, missed_analysis, trade_analysis, sentiment_analysis
+        price_analysis, missed_analysis, trade_analysis, sentiment_analysis, spot_correlation
     )
     save_params(new_params)
 
