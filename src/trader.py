@@ -14,6 +14,7 @@ from settings_manager import SettingsManager
 from db import TradingDB
 from retrain import load_current_params, PARAMS_PATH
 from crypto_prices import get_default as get_crypto_prices
+from price_predictor import predict_direction
 
 def _dollar_to_cents(val) -> int:
     """Convert a dollar string like '0.5000' to cents (50)."""
@@ -478,12 +479,11 @@ class Trader:
 
     def _value_bet_fallback(self, market_data):
         """
-        Fallback strategy: 1 value bet per hour on 15-minute BTC/ETH/SOL contracts only.
+        Prediction-based value bet on 15-minute BTC/ETH/SOL contracts.
 
-        Focuses on short-term "up or down" markets where we can use spot price
-        momentum to find edge. No monthly or long-dated contracts.
+        Uses our price predictor to forecast direction, then bets accordingly.
+        Max 1 bet per hour, only on 15-minute up/down contracts.
         """
-        import re
         from db import extract_asset
 
         markets = market_data.get("markets", [])
@@ -496,7 +496,7 @@ class Trader:
         if time.time() - self._last_value_bet_time < 3600:
             return None
 
-        # Don't stack too many fallback positions
+        # Don't stack positions
         fallback_positions = sum(
             1 for p in self.current_positions.values()
             if p.get('strategy') == 'value_bet'
@@ -504,88 +504,97 @@ class Trader:
         if fallback_positions >= 2:
             return None
 
-        mp = self.model_params
-        min_price = mp.get("min_entry_price_cents", 20)
-        max_price = mp.get("max_entry_price_cents", 80)
-        buy_yes_below = mp.get("buy_yes_below", 45)
-        buy_no_above = mp.get("buy_no_above", 55)
-
-        candidates = []
+        # Find 15-minute contracts
+        contracts_15m = []
         for m in markets:
             ticker = m.get('ticker') or m.get('id')
             if not ticker or ticker in self.current_positions:
                 continue
-
-            # ONLY 15-minute contracts (BTC15M, ETH15M, SOL15M)
             if '15M' not in ticker.upper():
                 continue
-
             yes_price = _get_market_price_cents(m)
+            no_price = _get_no_price_cents(m)
             if not yes_price or yes_price <= 0:
                 continue
-
-            price = yes_price / 100
-
-            if yes_price < min_price or yes_price > max_price:
-                continue
-
-            if price < (buy_yes_below / 100):
-                direction = 'long'
-                edge = (buy_yes_below / 100) - price
-            elif price > (buy_no_above / 100):
-                direction = 'short'
-                edge = price - (buy_no_above / 100)
-            else:
-                continue
-
-            # Boost for spot price momentum
             asset = extract_asset(ticker)
-            change_24h = self.crypto_prices.get_change_24h(asset)
-            spot_boost = 0
-            if change_24h is not None:
-                # If spot is trending in our direction, boost confidence
-                if direction == 'long' and change_24h > 1.0:
-                    spot_boost = 0.10  # Spot up > 1%, boost YES bet
-                elif direction == 'short' and change_24h < -1.0:
-                    spot_boost = 0.10  # Spot down > 1%, boost NO bet
-
-            candidates.append({
+            contracts_15m.append({
                 'market': m,
                 'ticker': ticker,
-                'price': yes_price,
-                'direction': direction,
-                'edge': edge + spot_boost,
+                'yes_price': yes_price,
+                'no_price': no_price,
                 'asset': asset,
             })
 
-        if not candidates:
-            self.logger.info("Value bet fallback: no extreme-priced markets found")
+        if not contracts_15m:
             return None
 
-        # Pick the market with the strongest signal
-        candidates.sort(key=lambda c: c['edge'], reverse=True)
-        best = candidates[0]
+        # Run prediction for each asset and find the best trade
+        best_trade = None
+        best_confidence = 0
 
-        # On Kalshi we always BUY — either YES or NO
-        side = 'yes' if best['direction'] == 'long' else 'no'
-        trade_price = best['price'] if side == 'yes' else _get_no_price_cents(best['market'])
+        for asset in ["BTC", "ETH", "SOL"]:
+            prediction = predict_direction(self.db, asset, self.crypto_prices)
+
+            if not prediction["should_trade"]:
+                continue
+
+            # Find a 15-min contract for this asset
+            asset_contracts = [c for c in contracts_15m if c['asset'] == asset]
+            if not asset_contracts:
+                continue
+
+            # Pick the contract (usually just one per asset per 15-min window)
+            contract = asset_contracts[0]
+
+            # Prediction says UP → buy YES, DOWN → buy NO
+            if prediction["direction"] == "up":
+                side = "yes"
+                trade_price = contract["yes_price"]
+            else:
+                side = "no"
+                trade_price = contract["no_price"]
+
+            if not trade_price or trade_price <= 0:
+                continue
+
+            # Combined confidence: prediction confidence + contract pricing edge
+            confidence = prediction["confidence"]
+
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_trade = {
+                    'contract': contract,
+                    'prediction': prediction,
+                    'side': side,
+                    'trade_price': trade_price,
+                    'asset': asset,
+                }
+
+        if not best_trade:
+            self.logger.info("Value bet: no confident predictions for 15-min contracts")
+            return None
+
+        c = best_trade['contract']
+        p = best_trade['prediction']
 
         self._last_value_bet_time = time.time()
 
-        self.logger.info(f"Value bet: buy {side.upper()} 1x {best['ticker']} "
-                        f"at {trade_price}¢ (edge: {best['edge']:.2f}, asset: {best['asset']})")
+        reasons_str = "; ".join(p["reasons"][:3])
+        self.logger.info(f"Value bet: {best_trade['asset']} predicted {p['direction'].upper()} "
+                        f"({p['confidence']:.0%}) — buying {best_trade['side'].upper()} "
+                        f"at {best_trade['trade_price']}¢")
 
         return {
-            'event_id': best['ticker'],
+            'event_id': c['ticker'],
             'action': 'buy',
-            'side': side,
+            'side': best_trade['side'],
             'quantity': 1,
-            'price': trade_price,
+            'price': best_trade['trade_price'],
             'strategy': 'value_bet',
-            'confidence': 0.5 + best['edge'],
-            'title': best['market'].get('title', best['ticker']),
-            'reason': f"15-min {best['asset']} — Buy {side.upper()} at {trade_price}¢ (edge: {best['edge']:.0%})",
-            'expiration_time': best['market'].get('expected_expiration_time') or best['market'].get('expiration_time'),
+            'confidence': p['confidence'],
+            'title': c['market'].get('title', c['ticker']),
+            'reason': f"Model predicts {best_trade['asset']} {p['direction'].upper()} ({p['confidence']:.0%}): {reasons_str}",
+            'expiration_time': c['market'].get('expected_expiration_time') or c['market'].get('expiration_time'),
         }
 
     def _pick_best_market(self, markets, direction):
