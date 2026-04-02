@@ -137,36 +137,22 @@ class CryptoPrices:
             raw = resp.json()
 
             result: Dict[str, Dict[str, Any]] = {}
-            data = raw.get("data", raw)
 
-            for symbol in ["BTC", "ETH", "SOL"]:
-                coin_data = None
-                if isinstance(data, dict):
-                    # Try various key formats
-                    coin_data = (data.get(symbol) or data.get(f"{symbol}/USD")
-                                 or data.get(symbol.lower()))
-                elif isinstance(data, list):
-                    # Might be a list of coin objects
-                    for item in data:
-                        if isinstance(item, dict) and item.get("symbol", "").upper() == symbol:
-                            coin_data = item
-                            break
-
-                if coin_data and isinstance(coin_data, dict):
-                    price = (coin_data.get("price") or coin_data.get("value")
-                             or coin_data.get("usd") or coin_data.get("rate"))
-                    change = (coin_data.get("change_24h") or coin_data.get("percent_change_24h")
-                              or coin_data.get("change24h"))
-                    if price is not None:
-                        result[symbol] = {
-                            "price": float(price),
-                            "change_24h": round(float(change), 4) if change is not None else None,
-                        }
-                elif coin_data is not None:
-                    try:
-                        result[symbol] = {"price": float(coin_data), "change_24h": None}
-                    except (ValueError, TypeError):
-                        pass
+            # FreeCryptoAPI returns: {"status": "success", "symbols": [{...}, ...]}
+            symbols_list = raw.get("symbols", [])
+            if isinstance(symbols_list, list):
+                for item in symbols_list:
+                    if not isinstance(item, dict):
+                        continue
+                    sym = item.get("symbol", "").upper()
+                    if sym in ("BTC", "ETH", "SOL"):
+                        price = item.get("last")
+                        change = item.get("daily_change_percentage")
+                        if price is not None:
+                            result[sym] = {
+                                "price": float(price),
+                                "change_24h": round(float(change), 4) if change is not None else None,
+                            }
 
             if result:
                 logger.info(f"FreeCryptoAPI: got prices for {list(result.keys())}")
