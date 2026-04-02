@@ -552,6 +552,7 @@ class Trader:
 
             # Build Kalshi v2 order payload
             # Under 3¢ → market order (instant fill), 3¢ and above → limit order
+            # Kalshi always requires a price field
             side = 'yes' if action.lower() == 'buy' else 'no'
             order_type = 'market' if price_cents < 3 else 'limit'
             order_payload = {
@@ -561,11 +562,10 @@ class Trader:
                 'count': quantity,
                 'type': order_type,
             }
-            if order_type == 'limit':
-                if side == 'yes':
-                    order_payload['yes_price'] = price_cents
-                else:
-                    order_payload['no_price'] = price_cents
+            if side == 'yes':
+                order_payload['yes_price'] = price_cents
+            else:
+                order_payload['no_price'] = price_cents
             # Remove None values
             order_payload = {k: v for k, v in order_payload.items() if v is not None}
             self.logger.info(f"Order payload: {order_payload}")
