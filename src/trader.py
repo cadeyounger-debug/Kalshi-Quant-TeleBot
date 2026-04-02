@@ -543,9 +543,13 @@ class Trader:
         if fallback_positions >= 2:
             return None
 
-        # Find tradeable contracts — prefer 15-min, fall back to others
+        # Find tradeable contracts — only same-day expiration
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        end_of_day = now.replace(hour=23, minute=59, second=59)
+
         contracts_15m = []
-        contracts_other = []
+        contracts_daily = []
         mp = self.model_params
         min_price = mp.get("min_entry_price_cents", 20)
         max_price = mp.get("max_entry_price_cents", 80)
@@ -554,6 +558,19 @@ class Trader:
             ticker = m.get('ticker') or m.get('id')
             if not ticker or ticker in self.current_positions:
                 continue
+
+            # Only same-day contracts
+            exp_str = m.get('expected_expiration_time') or m.get('expiration_time') or ''
+            if exp_str:
+                try:
+                    exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                    if exp_dt > end_of_day:
+                        continue  # Expires after today — skip
+                    if exp_dt < now:
+                        continue  # Already expired
+                except (ValueError, TypeError):
+                    continue  # Can't parse expiration — skip
+
             yes_price = _get_market_price_cents(m)
             no_price = _get_no_price_cents(m)
             if not yes_price or yes_price <= 0:
@@ -572,10 +589,10 @@ class Trader:
             if '15M' in ticker.upper():
                 contracts_15m.append(entry)
             else:
-                contracts_other.append(entry)
+                contracts_daily.append(entry)
 
-        # Use 15-min if available, otherwise fall back to other short-term
-        contracts = contracts_15m if contracts_15m else contracts_other
+        # Prefer 15-min, fall back to other same-day contracts
+        contracts = contracts_15m if contracts_15m else contracts_daily
         if not contracts:
             return None
 
