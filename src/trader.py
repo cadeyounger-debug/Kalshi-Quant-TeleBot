@@ -543,13 +543,15 @@ class Trader:
 
     def _value_bet_fallback(self, market_data, spot_prices=None):
         """
-        Probability-based value bet on BTC/ETH/SOL contracts.
+        Probability-based value bet on 15-minute BTC/ETH/SOL contracts.
 
-        For each contract, estimates the true probability of the underlying
-        crossing the strike price before expiration using realized volatility.
-        Buys when the market price is significantly below fair value.
+        Two trading windows per 15-min cycle:
+        1. OPENING (0-3 min in): max uncertainty, use momentum prediction
+           to bet early when YES/NO are near 50/50
+        2. CLOSING (last 3 min): trend is clear, bet with conviction
+           when price has moved decisively toward YES or NO
 
-        Max 1 bet per hour, prefers 15-minute contracts.
+        Falls back to monthly contracts when no 15-min are available.
         """
         from db import extract_asset
 
@@ -557,7 +559,7 @@ class Trader:
         if not markets:
             return None
 
-        # Rate limit: max 1 value bet per 5 minutes (matches 15-min contract cycle)
+        # Rate limit: max 1 value bet per 5 minutes
         if not hasattr(self, '_last_value_bet_time'):
             self._last_value_bet_time = 0
         if time.time() - self._last_value_bet_time < 300:
@@ -568,7 +570,7 @@ class Trader:
             1 for p in self.current_positions.values()
             if p.get('strategy') == 'value_bet'
         )
-        if fallback_positions >= 2:
+        if fallback_positions >= 3:
             return None
 
         # Find tradeable contracts — prefer 15-min, allow monthly
@@ -623,7 +625,7 @@ class Trader:
 
         is_15m = bool(contracts_15m)
 
-        # Evaluate each contract for mispricing using strike probability model
+        # Evaluate each contract — aware of opening vs closing window
         best_trade = None
         best_edge = 0
 
@@ -636,16 +638,14 @@ class Trader:
             # e.g. "Target Price: $67,027.71"
             if strike <= 0:
                 sub_title = c['market'].get('yes_sub_title', '')
-                target_match = re.search(r'\$([\\d,]+\\.?\\d*)', sub_title)
-                if not target_match:
-                    target_match = re.search(r'[\$]([\d,]+\.?\d*)', sub_title)
+                target_match = re.search(r'[\$]([\d,]+\.?\d*)', sub_title)
                 if target_match:
                     strike = float(target_match.group(1).replace(',', ''))
 
             if strike <= 0:
                 continue
 
-            # Get spot price for this asset
+            # Get spot price
             spot = None
             if spot_prices and asset in spot_prices:
                 spot = spot_prices[asset].get("price")
@@ -655,6 +655,22 @@ class Trader:
                 continue
 
             exp_time = c['market'].get('expected_expiration_time') or c['market'].get('expiration_time')
+
+            # Determine timing within the 15-min window
+            window_phase = "middle"
+            minutes_left = None
+            if exp_time:
+                try:
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc)
+                    exp_dt = datetime.fromisoformat(exp_time.replace("Z", "+00:00"))
+                    minutes_left = (exp_dt - now).total_seconds() / 60
+                    if minutes_left > 12:
+                        window_phase = "opening"  # First 3 min of window
+                    elif minutes_left < 3:
+                        window_phase = "closing"  # Last 3 min
+                except (ValueError, TypeError):
+                    pass
 
             evaluation = evaluate_contract(
                 db=self.db,
@@ -672,6 +688,24 @@ class Trader:
                 continue
 
             edge = max(evaluation["edge_yes"], evaluation["edge_no"])
+
+            # Boost edge based on window timing
+            if is_15m:
+                if window_phase == "opening":
+                    # Opening: most uncertainty, biggest mispricings
+                    edge *= 1.3
+                    evaluation["reasons"].append(f"Opening window ({minutes_left:.0f}min left)")
+                elif window_phase == "closing":
+                    # Closing: trend is clear, high conviction
+                    # Only trade if price has moved decisively (far from 50/50)
+                    yes_p = c['yes_price']
+                    if yes_p < 25 or yes_p > 75:
+                        edge *= 1.5  # Strong trend, boost
+                        evaluation["reasons"].append(f"Closing window ({minutes_left:.0f}min left, price decisive)")
+                    else:
+                        edge *= 0.5  # Still uncertain near close, reduce
+                        evaluation["reasons"].append(f"Closing but uncertain ({minutes_left:.0f}min left)")
+
             if edge > best_edge:
                 best_edge = edge
                 side = "yes" if evaluation["recommendation"] == "buy_yes" else "no"
