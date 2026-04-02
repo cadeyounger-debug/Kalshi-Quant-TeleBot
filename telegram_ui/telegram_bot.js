@@ -43,12 +43,13 @@ Welcome to the advanced Kalshi Trading Bot! This bot provides sophisticated quan
 
 *Available Commands:*
 /status - Get current bot status
-/positions - View current positions
 /balance - Check account balance
-/start_trading - Start automated trading
-/stop_trading - Stop automated trading
-/settings - Configure bot settings
+/positions - View current positions
+/start\\_trading - Start automated trading
+/stop\\_trading - Stop automated trading
 /performance - View performance metrics
+/settings - Configure bot settings
+/dbstats - View database stats
 /help - Show this help message
 
 *Quick Actions:*
@@ -73,6 +74,9 @@ Use the inline keyboard below for quick access to common functions.
                         ],
                         [
                             { text: '⚙️ Settings', callback_data: 'settings' },
+                            { text: '🗄️ DB Stats', callback_data: 'dbstats' }
+                        ],
+                        [
                             { text: '❓ Help', callback_data: 'help' }
                         ]
                     ]
@@ -215,6 +219,9 @@ Use the inline keyboard below for quick access to common functions.
                     break;
                 case 'help':
                     this.handleHelpCommand(chatId);
+                    break;
+                case 'dbstats':
+                    this.handleDbStatsCommand(chatId);
                     break;
                 case 'set_api_key':
                     this.awaitingApiKeyChats.add(chatId);
