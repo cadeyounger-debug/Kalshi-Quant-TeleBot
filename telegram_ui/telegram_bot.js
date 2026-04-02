@@ -263,19 +263,21 @@ Use the inline keyboard below for quick access to common functions.
     async handlePositionsCommand(chatId) {
         try {
             const positions = await this.getCurrentPositions();
-            
+
             if (positions.length === 0) {
-                this.bot.sendMessage(chatId, '📈 *Current Positions*\n\nNo open positions.', { parse_mode: 'Markdown' });
+                this.bot.sendMessage(chatId, '📈 Current Positions\n\nNo open positions.');
                 return;
             }
 
-            let positionsMessage = '📈 *Current Positions*\n\n';
+            let positionsMessage = `📈 Current Positions (${positions.length})\n\n`;
             positions.forEach((position, index) => {
-                positionsMessage += `${index + 1}. *${position.eventName}*\n`;
-                positionsMessage += `   Position: ${position.quantity} units\n`;
-                positionsMessage += `   Entry Price: $${position.entryPrice}\n`;
-                positionsMessage += `   Current Price: $${position.currentPrice}\n`;
-                positionsMessage += `   P&L: ${position.pnl >= 0 ? '🟢' : '🔴'} $${position.pnl.toFixed(2)}\n\n`;
+                const ticker = position.ticker || 'Unknown';
+                const side = position.side || '?';
+                const qty = position.quantity || 0;
+                const exposure = position.exposure || '0';
+                const cost = position.cost || '0';
+                positionsMessage += `${index + 1}. ${ticker}\n`;
+                positionsMessage += `   ${side} x${qty} | Cost: $${cost} | Value: $${exposure}\n\n`;
             });
 
             this.bot.sendMessage(chatId, positionsMessage, { parse_mode: 'Markdown' });
@@ -322,18 +324,19 @@ Fees Paid: $${Number(fees).toFixed(2)}`;
             const response = await axios.get(`${this.interfaceBaseUrl}/api/dbstats`);
             const s = response.data;
             const msg = `
-🗄️ *Database Stats*
+🗄️ Database Stats
 
-*Market Snapshots:* ${s.total_snapshots || 0}
+Market Snapshots: ${s.total_snapshots || 0}
   BTC: ${s.btc_snapshots || 0}
   ETH: ${s.eth_snapshots || 0}
   SOL: ${s.sol_snapshots || 0}
 
-*Sentiment Records:* ${s.total_sentiment || 0}
-*Trade Decisions:* ${s.total_decisions || 0}
-*Trades Executed:* ${s.total_trades || 0}
+Sentiment Records: ${s.total_sentiment || 0}
+Spot Prices Recorded: ${s.crypto_prices || 0}
+Trade Decisions: ${s.total_decisions || 0}
+Trades Executed: ${s.total_trades || 0}
             `;
-            this.bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+            this.bot.sendMessage(chatId, msg);
         } catch (error) {
             this.bot.sendMessage(chatId, `❌ Error fetching db stats: ${error.message}`);
         }

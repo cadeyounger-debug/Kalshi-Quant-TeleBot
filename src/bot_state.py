@@ -94,10 +94,26 @@ def fetch_balance(api: KalshiAPI) -> Dict[str, Any]:
 
 def fetch_positions(api: KalshiAPI) -> Dict[str, Any]:
     response = api.get_positions() or {}
-    positions = response.get("positions") or response.get("data") or []
+    # Kalshi v2 returns market_positions (individual contracts)
+    market_positions = response.get("market_positions") or []
+    # Filter to only positions with actual holdings (position != 0)
+    active = []
+    for p in market_positions:
+        pos = float(p.get("position_fp", 0))
+        if pos != 0:
+            active.append({
+                "ticker": p.get("ticker", ""),
+                "position": pos,
+                "side": "YES" if pos > 0 else "NO",
+                "quantity": abs(int(pos)),
+                "exposure": p.get("market_exposure_dollars", "0"),
+                "cost": p.get("total_traded_dollars", "0"),
+                "fees": p.get("fees_paid_dollars", "0"),
+                "realized_pnl": p.get("realized_pnl_dollars", "0"),
+            })
     return {
-        "positions": positions,
-        "count": len(positions),
+        "positions": active,
+        "count": len(active),
         "raw": response,
     }
 
@@ -197,15 +213,28 @@ def fetch_dbstats() -> Dict[str, Any]:
     """Get database statistics."""
     try:
         from db import TradingDB
+        import sqlite3
         db = TradingDB()
+
+        def count(table, where=""):
+            with db._connect() as conn:
+                sql = f"SELECT COUNT(*) FROM {table}"
+                if where:
+                    sql += f" WHERE {where}"
+                return conn.execute(sql).fetchone()[0]
+
+        # Count trades excluding FAILED
+        successful_trades = count("trades", "order_result NOT LIKE '%FAILED%'")
+
         return {
-            "total_snapshots": len(db.get_snapshots(limit=100000)),
-            "btc_snapshots": len(db.get_snapshots(asset="BTC", limit=100000)),
-            "eth_snapshots": len(db.get_snapshots(asset="ETH", limit=100000)),
-            "sol_snapshots": len(db.get_snapshots(asset="SOL", limit=100000)),
-            "total_sentiment": len(db.get_sentiment(limit=100000)),
-            "total_decisions": len(db.get_decisions(limit=100000)),
-            "total_trades": len(db.get_trades(limit=100000)),
+            "total_snapshots": count("market_snapshots"),
+            "btc_snapshots": count("market_snapshots", "asset='BTC'"),
+            "eth_snapshots": count("market_snapshots", "asset='ETH'"),
+            "sol_snapshots": count("market_snapshots", "asset='SOL'"),
+            "total_sentiment": count("news_sentiment"),
+            "total_decisions": count("trade_decisions"),
+            "total_trades": successful_trades,
+            "crypto_prices": count("crypto_prices"),
             "db_path": db._db_path,
         }
     except Exception as e:

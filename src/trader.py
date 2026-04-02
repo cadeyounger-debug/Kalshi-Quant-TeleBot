@@ -675,10 +675,6 @@ class Trader:
                 )
             else:
                 self.logger.error(f"Order failed for {event_id}")
-                self.db.record_trade(
-                    event_id, side=side, quantity=quantity, price=price_cents,
-                    strategy=strategy, order_result="FAILED",
-                )
                 return
 
             # Record trade in performance analytics
