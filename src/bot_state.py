@@ -46,29 +46,43 @@ def fetch_balance(api: KalshiAPI) -> Dict[str, Any]:
                 "total_equity": None,
                 "unrealized_pnl": None,
                 "realized_pnl": None,
+                "fees_paid": None,
                 "timestamp": None,
             },
             "raw": {},
             "error": "Kalshi API returned no data — check KALSHI_API_KEY and KALSHI_PRIVATE_KEY env vars",
         }
 
+    # Get positions to calculate real P&L
+    positions_data = api.get_positions() or {}
+    event_positions = positions_data.get("event_positions") or []
+
+    total_cost = 0.0
+    total_exposure = 0.0
+    total_fees = 0.0
+    total_realized = 0.0
+    for ep in event_positions:
+        total_cost += float(ep.get("total_cost_dollars", 0))
+        total_exposure += float(ep.get("event_exposure_dollars", 0))
+        total_fees += float(ep.get("fees_paid_dollars", 0))
+        total_realized += float(ep.get("realized_pnl_dollars", 0))
+
+    # Unrealized P&L = current exposure value - total cost paid
+    # (exposure is what positions are worth now)
+    unrealized_pnl = total_exposure - total_cost if total_cost > 0 else 0
+
+    available = _cents_to_dollars(raw.get("balance")) or 0
+    portfolio_value = _cents_to_dollars(
+        raw["portfolio_value"] if "portfolio_value" in raw else 0
+    ) or 0
+
     summary = {
-        "available": _cents_to_dollars(
-            raw.get("balance")
-            or raw.get("available_cash")
-            or raw.get("available_balance")
-            or raw.get("cash_balance")
-        ),
-        "total_equity": _cents_to_dollars(
-            raw["portfolio_value"] if "portfolio_value" in raw else
-            raw.get("equity") or raw.get("total_equity")
-        ),
-        "unrealized_pnl": _cents_to_dollars(
-            raw.get("unrealized_pnl") or raw.get("unrealized_pl")
-        ),
-        "realized_pnl": _cents_to_dollars(
-            raw.get("realized_pnl") or raw.get("realized_pl")
-        ),
+        "available": available,
+        "total_equity": round(available + portfolio_value / 100, 2) if portfolio_value else available,
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "realized_pnl": round(total_realized, 2),
+        "fees_paid": round(total_fees, 2),
+        "total_cost": round(total_cost, 2),
         "timestamp": raw.get("updated_ts") or raw.get("timestamp") or raw.get("time"),
     }
 

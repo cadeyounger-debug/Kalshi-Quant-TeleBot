@@ -297,18 +297,21 @@ Use the inline keyboard below for quick access to common functions.
             const balance = data.summary || {};
             const available = balance.available ?? 0;
             const equity = balance.total_equity ?? balance.totalEquity ?? 0;
-            const unrealized = balance.unrealized_pnl ?? balance.unrealizedPnL ?? 0;
-            const realized = balance.realized_pnl ?? balance.realizedPnL ?? 0;
-            const balanceMessage = `
-💰 *Account Balance*
+            const unrealized = balance.unrealized_pnl ?? 0;
+            const realized = balance.realized_pnl ?? 0;
+            const fees = balance.fees_paid ?? 0;
+            const totalCost = balance.total_cost ?? 0;
+            const balanceMessage =
+`💰 Account Balance
 
-*Available Balance:* $${Number(available).toFixed(2)}
-*Total Equity:* $${Number(equity).toFixed(2)}
-*Unrealized P&L:* ${unrealized >= 0 ? '🟢' : '🔴'} $${Number(unrealized).toFixed(2)}
-*Realized P&L:* ${realized >= 0 ? '🟢' : '🔴'} $${Number(realized).toFixed(2)}
-            `;
+Available: $${Number(available).toFixed(2)}
+Portfolio Value: $${Number(equity).toFixed(2)}
+Total Invested: $${Number(totalCost).toFixed(2)}
+Unrealized P&L: ${unrealized >= 0 ? '🟢' : '🔴'} $${Number(unrealized).toFixed(2)}
+Realized P&L: ${realized >= 0 ? '🟢' : '🔴'} $${Number(realized).toFixed(2)}
+Fees Paid: $${Number(fees).toFixed(2)}`;
 
-            this.bot.sendMessage(chatId, balanceMessage, { parse_mode: 'Markdown' });
+            this.bot.sendMessage(chatId, balanceMessage);
         } catch (error) {
             this.bot.sendMessage(chatId, `❌ Error fetching balance: ${error.message}`);
         }
