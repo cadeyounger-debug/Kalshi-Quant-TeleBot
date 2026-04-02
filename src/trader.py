@@ -292,37 +292,20 @@ class Trader:
         """
         from datetime import datetime, timedelta
 
-        tickers = [
-            # Year-end price events (highest liquidity)
-            "KXBTCY-27JAN0100",
-            "KXETHY-27JAN0100",
-            "KXSOLD26-27JAN0100",
-            "KXSOL26500-27JAN0100",
-            # Cross-crypto / thematic
-            "KXBTCVSGOLD-26",
-            "KXBTCRESERVE-27",
-        ]
-
+        tickers = []
         now = datetime.now()
 
-        # Monthly min/max for current and next month
-        for month_offset in range(0, 2):
-            if month_offset == 0:
-                next_m = now.month + 1 if now.month < 12 else 1
-                next_y = now.year if now.month < 12 else now.year + 1
-                end = datetime(next_y, next_m, 1) - timedelta(days=1)
-            else:
-                next_m = now.month + 2 if now.month < 11 else (now.month + 2 - 12)
-                next_y = now.year if now.month < 11 else now.year + 1
-                end = datetime(next_y, next_m, 1) - timedelta(days=1)
+        # Monthly min/max for current month only (expires end of month)
+        next_m = now.month + 1 if now.month < 12 else 1
+        next_y = now.year if now.month < 12 else now.year + 1
+        end = datetime(next_y, next_m, 1) - timedelta(days=1)
+        dt = end.strftime("%y%b%d").upper()
+        for coin, code in [("BTC", "BTC"), ("ETH", "ETH"), ("SOL", "SOL")]:
+            tickers.append(f"KX{coin}MAXMON-{code}-{dt}")
+            tickers.append(f"KX{coin}MINMON-{code}-{dt}")
 
-            dt = end.strftime("%y%b%d").upper()
-            for coin, code in [("BTC", "BTC"), ("ETH", "ETH"), ("SOL", "SOL")]:
-                tickers.append(f"KX{coin}MAXMON-{code}-{dt}")
-                tickers.append(f"KX{coin}MINMON-{code}-{dt}")
-
-        # Daily price events for next 3 days
-        for days_ahead in range(0, 3):
+        # Daily price events for next 7 days
+        for days_ahead in range(0, 7):
             d = now + timedelta(days=days_ahead)
             ds = d.strftime("%y%b%d").upper()
             for coin in ["KXBTC", "KXETH", "KXSOL"]:
