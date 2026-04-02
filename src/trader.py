@@ -61,7 +61,7 @@ class Trader:
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
         self.market_data_streamer = MarketDataStreamer(
-            api, update_interval=300, event_tickers=crypto_events  # Every 5 min
+            api, update_interval=60, event_tickers=crypto_events  # Every 1 min for 15-min markets
         )
         self.performance_analytics = PerformanceAnalytics()
 
@@ -311,6 +311,15 @@ class Trader:
             for coin in ["KXBTC", "KXETH", "KXSOL"]:
                 tickers.append(f"{coin}-{ds}0100")
 
+        # 15-minute events for the next 2 hours
+        for mins_ahead in range(0, 120, 15):
+            t = now + timedelta(minutes=mins_ahead)
+            ds = t.strftime("%y%b%d").upper()
+            m15 = (t.minute // 15) * 15
+            hm = f"{t.hour:02d}{m15:02d}"
+            for coin in ["KXBTC15M", "KXETH15M", "KXSOL15M"]:
+                tickers.append(f"{coin}-{ds}{hm}")
+
         # Deduplicate
         return list(dict.fromkeys(tickers))
 
@@ -325,7 +334,8 @@ class Trader:
 
         self._cache_cycle += 1
 
-        if self._market_cache and self._cache_cycle % 5 != 1:
+        # Refresh every 2 cycles (short-term 15-min tickers change frequently)
+        if self._market_cache and self._cache_cycle % 2 != 1:
             self.logger.info(f"Using cached crypto markets ({len(self._market_cache)} markets)")
             return self._market_cache
 
