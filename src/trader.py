@@ -709,11 +709,12 @@ class Trader:
             if edge > best_edge:
                 best_edge = edge
                 side = "yes" if evaluation["recommendation"] == "buy_yes" else "no"
+                trade_price = c['yes_price'] if side == 'yes' else c['no_price']
                 best_trade = {
                     'contract': c,
                     'prediction': evaluation,
                     'side': side,
-                    'trade_price': evaluation.get("trade_price", c['yes_price']),
+                    'trade_price': trade_price,
                     'asset': asset,
                 }
 
@@ -743,7 +744,7 @@ class Trader:
             'strategy': 'value_bet',
             'confidence': p['confidence'],
             'title': c['market'].get('title', c['ticker']),
-            'reason': f"{'15-min' if is_15m else 'Short-term'} {best_trade['asset']} — Model predicts {p['direction'].upper()} ({p['confidence']:.0%}): {reasons_str}",
+            'reason': f"{'15-min' if is_15m else 'Short-term'} {best_trade['asset']} — {p.get('recommendation', 'buy').upper()} (P={p.get('probability', 0):.0%}, edge={best_edge:+.0f}¢): {reasons_str}",
             'expiration_time': c['market'].get('expected_expiration_time') or c['market'].get('expiration_time'),
         }
 
