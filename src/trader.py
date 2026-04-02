@@ -15,6 +15,27 @@ from db import TradingDB
 from retrain import load_current_params, PARAMS_PATH
 from crypto_prices import get_default as get_crypto_prices
 from price_predictor import predict_direction
+import re
+
+
+def _parse_strike_from_ticker(ticker: str) -> float:
+    """Extract strike/target price from Kalshi market ticker.
+
+    Kalshi crypto tickers encode the strike as a suffix like:
+      KXBTC-26APR020100-T85000  → $85,000
+      KXETH-26APR020100-T2100   → $2,100
+      KXSOL-26APR020100-T80     → $80
+    Also handles floor/ceiling patterns in monthly min/max tickers.
+    """
+    # Match -T followed by digits at end of ticker
+    m = re.search(r'-T(\d+)$', ticker or '')
+    if m:
+        return float(m.group(1))
+    # Try floor/ceiling pattern: -B followed by digits
+    m = re.search(r'-B(\d+)$', ticker or '')
+    if m:
+        return float(m.group(1))
+    return 0.0
 
 def _dollar_to_cents(val) -> int:
     """Convert a dollar string like '0.5000' to cents (50)."""
@@ -415,9 +436,20 @@ class Trader:
             # Check exits FIRST — take profit, stop loss, time exit
             self.check_exits(markets)
 
-            # Record market snapshots to db
+            # Record market snapshots to db — including strike, spot, and expiration
             for m in markets:
                 ticker = m.get("ticker", "")
+                asset = None
+                for prefix, name in [("KXBTC", "BTC"), ("KXETH", "ETH"), ("KXSOL", "SOL")]:
+                    if ticker.upper().startswith(prefix):
+                        asset = name
+                        break
+
+                # Get current spot price for this asset
+                current_spot = None
+                if asset and spot_prices and asset in spot_prices:
+                    current_spot = spot_prices[asset].get("price")
+
                 self.db.record_market_snapshot(
                     ticker,
                     title=m.get("title", ""),
@@ -426,6 +458,9 @@ class Trader:
                     no_bid=float(m.get("no_bid_dollars", 0) or 0),
                     no_ask=float(m.get("no_ask_dollars", 0) or 0),
                     volume=float(m.get("volume_24h_fp", 0) or 0),
+                    strike_price=_parse_strike_from_ticker(ticker),
+                    spot_price=current_spot,
+                    expiration_time=m.get("expected_expiration_time") or m.get("expiration_time") or m.get("close_time"),
                 )
 
             market_data = {"markets": markets}

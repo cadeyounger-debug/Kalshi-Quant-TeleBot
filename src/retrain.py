@@ -138,7 +138,8 @@ def analyze_price_movements() -> Dict[str, Any]:
     cutoff = get_cutoff_date()
 
     rows = query_db(
-        """SELECT ticker, asset, yes_bid, yes_ask, no_bid, no_ask, timestamp
+        """SELECT ticker, asset, yes_bid, yes_ask, no_bid, no_ask,
+                  strike_price, spot_price, expiration_time, timestamp
            FROM market_snapshots
            WHERE timestamp >= ?
            ORDER BY ticker, timestamp""",
@@ -159,6 +160,9 @@ def analyze_price_movements() -> Dict[str, Any]:
         "profitable_if_bought_no": [],
         "price_range_outcomes": defaultdict(lambda: {"up": 0, "down": 0, "flat": 0, "avg_move": []}),
         "asset_outcomes": defaultdict(lambda: {"up": 0, "down": 0, "flat": 0, "avg_move": []}),
+        # New: outcomes bucketed by distance-to-strike and time-to-expiry
+        "distance_outcomes": defaultdict(lambda: {"up": 0, "down": 0, "flat": 0, "avg_move": []}),
+        "time_to_expiry_outcomes": defaultdict(lambda: {"up": 0, "down": 0, "flat": 0, "avg_move": []}),
     }
 
     for ticker, snaps in by_ticker.items():
@@ -192,6 +196,61 @@ def analyze_price_movements() -> Dict[str, Any]:
 
             results["price_range_outcomes"][bucket_key]["avg_move"].append(change)
             results["asset_outcomes"][asset]["avg_move"].append(change)
+
+            # --- Bucket by distance-to-strike (spot vs target) ---
+            snap = snaps[i]
+            strike = snap.get("strike_price") or 0
+            spot = snap.get("spot_price") or 0
+            if strike > 0 and spot > 0:
+                pct_distance = (spot - strike) / strike * 100  # positive = above strike
+                if pct_distance > 5:
+                    dist_key = "above_5pct"
+                elif pct_distance > 0:
+                    dist_key = "above_0-5pct"
+                elif pct_distance > -5:
+                    dist_key = "below_0-5pct"
+                else:
+                    dist_key = "below_5pct"
+
+                bucket_data = results["distance_outcomes"][dist_key]
+                if change > 0.02:
+                    bucket_data["up"] += 1
+                elif change < -0.02:
+                    bucket_data["down"] += 1
+                else:
+                    bucket_data["flat"] += 1
+                bucket_data["avg_move"].append(change)
+
+            # --- Bucket by time-to-expiry ---
+            exp_time = snap.get("expiration_time")
+            snap_time = snap.get("timestamp")
+            if exp_time and snap_time:
+                try:
+                    from datetime import datetime, timezone
+                    exp_dt = datetime.fromisoformat(exp_time.replace("Z", "+00:00"))
+                    snap_dt = datetime.fromisoformat(snap_time.replace("Z", "+00:00"))
+                    hours_left = (exp_dt - snap_dt).total_seconds() / 3600
+                    if hours_left < 0.5:
+                        tte_key = "<30min"
+                    elif hours_left < 2:
+                        tte_key = "30min-2h"
+                    elif hours_left < 12:
+                        tte_key = "2h-12h"
+                    elif hours_left < 48:
+                        tte_key = "12h-2d"
+                    else:
+                        tte_key = ">2d"
+
+                    tte_data = results["time_to_expiry_outcomes"][tte_key]
+                    if change > 0.02:
+                        tte_data["up"] += 1
+                    elif change < -0.02:
+                        tte_data["down"] += 1
+                    else:
+                        tte_data["flat"] += 1
+                    tte_data["avg_move"].append(change)
+                except (ValueError, TypeError):
+                    pass
 
         # Check if buying YES at first mid would have been profitable at peak
         first_mid = _mid_price(snaps[0], "yes")
@@ -628,6 +687,50 @@ def compute_optimal_params(
             params["min_entry_price_cents"] = max(min(all_mins), 5)
             params["max_entry_price_cents"] = min(max(all_maxs), 95)
             logger.info(f"Learned entry range: {params['min_entry_price_cents']}-{params['max_entry_price_cents']}¢")
+
+    # --- Log distance-to-strike outcomes (new) ---
+    distance_outcomes = price_analysis.get("distance_outcomes", {})
+    if distance_outcomes:
+        logger.info("Distance-to-strike outcomes:")
+        for dist_key in ["above_5pct", "above_0-5pct", "below_0-5pct", "below_5pct"]:
+            stats = distance_outcomes.get(dist_key)
+            if not stats:
+                continue
+            total = stats["up"] + stats["down"] + stats["flat"]
+            if total < 5:
+                continue
+            wr = stats["up"] / total
+            avg = np.mean(stats["avg_move"]) if stats["avg_move"] else 0
+            logger.info(f"  {dist_key}: win_rate={wr:.0%}, avg_move={avg:.2%}, n={total}")
+        params["distance_to_strike_outcomes"] = {
+            k: {"win_rate": round(v["up"] / max(v["up"] + v["down"] + v["flat"], 1), 3),
+                "avg_move": round(float(np.mean(v["avg_move"])) if v["avg_move"] else 0, 4),
+                "n": v["up"] + v["down"] + v["flat"]}
+            for k, v in distance_outcomes.items()
+            if v["up"] + v["down"] + v["flat"] >= 5
+        }
+
+    # --- Log time-to-expiry outcomes (new) ---
+    tte_outcomes = price_analysis.get("time_to_expiry_outcomes", {})
+    if tte_outcomes:
+        logger.info("Time-to-expiry outcomes:")
+        for tte_key in ["<30min", "30min-2h", "2h-12h", "12h-2d", ">2d"]:
+            stats = tte_outcomes.get(tte_key)
+            if not stats:
+                continue
+            total = stats["up"] + stats["down"] + stats["flat"]
+            if total < 5:
+                continue
+            wr = stats["up"] / total
+            avg = np.mean(stats["avg_move"]) if stats["avg_move"] else 0
+            logger.info(f"  {tte_key}: win_rate={wr:.0%}, avg_move={avg:.2%}, n={total}")
+        params["time_to_expiry_outcomes"] = {
+            k: {"win_rate": round(v["up"] / max(v["up"] + v["down"] + v["flat"], 1), 3),
+                "avg_move": round(float(np.mean(v["avg_move"])) if v["avg_move"] else 0, 4),
+                "n": v["up"] + v["down"] + v["flat"]}
+            for k, v in tte_outcomes.items()
+            if v["up"] + v["down"] + v["flat"] >= 5
+        }
 
     # --- Learn from missed opportunities ---
     missed_wins = missed_analysis.get("missed_wins", [])

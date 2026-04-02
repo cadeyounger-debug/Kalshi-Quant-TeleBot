@@ -36,16 +36,19 @@ def extract_asset(ticker: str) -> str:
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS market_snapshots (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker      TEXT NOT NULL,
-    asset       TEXT NOT NULL,
-    title       TEXT,
-    yes_bid     REAL,
-    yes_ask     REAL,
-    no_bid      REAL,
-    no_ask      REAL,
-    volume      INTEGER,
-    timestamp   TEXT NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT NOT NULL,
+    asset           TEXT NOT NULL,
+    title           TEXT,
+    yes_bid         REAL,
+    yes_ask         REAL,
+    no_bid          REAL,
+    no_ask          REAL,
+    volume          INTEGER,
+    strike_price    REAL,
+    spot_price      REAL,
+    expiration_time TEXT,
+    timestamp       TEXT NOT NULL
 );
 
 -- Add no_bid/no_ask columns if upgrading from older schema
@@ -136,6 +139,14 @@ class TradingDB:
                 conn.execute("ALTER TABLE market_snapshots ADD COLUMN no_bid REAL")
                 conn.execute("ALTER TABLE market_snapshots ADD COLUMN no_ask REAL")
 
+            # Migrate: add strike_price, spot_price, expiration_time if missing
+            for col in ("strike_price REAL", "spot_price REAL", "expiration_time TEXT"):
+                col_name = col.split()[0]
+                try:
+                    conn.execute(f"SELECT {col_name} FROM market_snapshots LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute(f"ALTER TABLE market_snapshots ADD COLUMN {col}")
+
             # Migrate: create crypto_prices table if missing (for existing DBs)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS crypto_prices ("
@@ -169,6 +180,9 @@ class TradingDB:
         no_bid: float = None,
         no_ask: float = None,
         volume: int = None,
+        strike_price: float = None,
+        spot_price: float = None,
+        expiration_time: str = None,
         asset: str = None,
         timestamp: str = None,
     ) -> int:
@@ -177,9 +191,12 @@ class TradingDB:
         with self._lock:
             with self._connect() as conn:
                 cur = conn.execute(
-                    "INSERT INTO market_snapshots (ticker, asset, title, yes_bid, yes_ask, no_bid, no_ask, volume, timestamp) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (ticker, asset, title, yes_bid, yes_ask, no_bid, no_ask, volume, timestamp),
+                    "INSERT INTO market_snapshots "
+                    "(ticker, asset, title, yes_bid, yes_ask, no_bid, no_ask, volume, "
+                    "strike_price, spot_price, expiration_time, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ticker, asset, title, yes_bid, yes_ask, no_bid, no_ask, volume,
+                     strike_price, spot_price, expiration_time, timestamp),
                 )
                 return cur.lastrowid
 
