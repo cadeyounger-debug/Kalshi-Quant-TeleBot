@@ -457,19 +457,19 @@ class Trader:
             price = yes_price / 100
 
             # We want markets with strong consensus (price far from 0.50)
-            distance_from_center = abs(price - 0.50)
-            if distance_from_center < 0.15:
-                continue  # Skip markets near 50/50, no edge
-
-            # Bet YES on cheap contracts (< 30¢), NO on expensive ones (> 70¢)
-            if price < 0.30:
-                direction = 'long'
-                edge = 0.30 - price  # How much below 30¢
-            elif price > 0.70:
-                direction = 'short'
-                edge = price - 0.70  # How much above 70¢
-            else:
+            # Only trade markets in the 20¢-80¢ range — real uncertainty, real odds
+            if price < 0.20 or price > 0.80:
                 continue
+
+            # Bet YES on underpriced contracts (20-45¢), NO on overpriced (55-80¢)
+            if price < 0.45:
+                direction = 'long'
+                edge = 0.45 - price  # How far below 45¢
+            elif price > 0.55:
+                direction = 'short'
+                edge = price - 0.55  # How far above 55¢
+            else:
+                continue  # Skip 45-55¢ — too close to a coin flip
 
             candidates.append({
                 'market': m,
