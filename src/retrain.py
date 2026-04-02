@@ -107,14 +107,33 @@ def get_cutoff_date() -> str:
 # ---------------------------------------------------------------------------
 # Analysis 1: Price movements across ALL observed markets
 # ---------------------------------------------------------------------------
-def analyze_price_movements() -> Dict[str, Any]:
-    """For each market ticker, track how the price changed over time.
+def _mid_price(snap, side="yes") -> float:
+    """Compute midpoint price for a snapshot to avoid bid-ask spread bias.
 
-    Groups snapshots by ticker, computes:
-    - Price at first observation vs last observation
-    - Max price seen, min price seen
-    - Whether buying YES at the first price would have been profitable
-    - Which price ranges had the most upward vs downward movement
+    Using (bid + ask) / 2 gives a fair value estimate that doesn't
+    artificially show negative movement just because bid < ask.
+    """
+    if side == "yes":
+        bid = snap.get("yes_bid") or 0
+        ask = snap.get("yes_ask") or 0
+    else:
+        bid = snap.get("no_bid") or 0
+        ask = snap.get("no_ask") or 0
+
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2
+    return ask or bid or 0
+
+
+def analyze_price_movements() -> Dict[str, Any]:
+    """For each market ticker, track how the mid-price changed over time.
+
+    Uses mid-price (avg of bid+ask) to avoid the systematic negative bias
+    that occurs when comparing entry ask to exit bid (the spread always
+    makes this look like a loss even when the market hasn't moved).
+
+    Compares consecutive snapshots rather than first-to-last, which avoids
+    conflating expired-at-zero contracts with actual price declines.
     """
     cutoff = get_cutoff_date()
 
@@ -136,7 +155,7 @@ def analyze_price_movements() -> Dict[str, Any]:
 
     results = {
         "total_markets_observed": len(by_ticker),
-        "profitable_if_bought_yes": [],  # (ticker, asset, entry_price, max_price, gain%)
+        "profitable_if_bought_yes": [],
         "profitable_if_bought_no": [],
         "price_range_outcomes": defaultdict(lambda: {"up": 0, "down": 0, "flat": 0, "avg_move": []}),
         "asset_outcomes": defaultdict(lambda: {"up": 0, "down": 0, "flat": 0, "avg_move": []}),
@@ -148,73 +167,76 @@ def analyze_price_movements() -> Dict[str, Any]:
 
         asset = snaps[0]["asset"]
 
-        # --- YES side analysis ---
-        first_yes_ask = snaps[0]["yes_ask"] or 0
-        last_yes_bid = snaps[-1]["yes_bid"] or 0
-        max_yes_bid = max((s["yes_bid"] or 0) for s in snaps)
+        # --- YES side: compare consecutive mid-prices ---
+        for i in range(len(snaps) - 1):
+            entry_mid = _mid_price(snaps[i], "yes")
+            exit_mid = _mid_price(snaps[i + 1], "yes")
+            if entry_mid <= 0:
+                continue
 
-        # --- NO side analysis ---
-        first_no_ask = snaps[0].get("no_ask") or 0
-        last_no_bid = snaps[-1].get("no_bid") or 0
-        max_no_bid = max((s.get("no_bid") or 0) for s in snaps)
+            change = (exit_mid - entry_mid) / entry_mid
 
-        # YES price movement
-        if first_yes_ask > 0:
-            yes_change = (last_yes_bid - first_yes_ask) / first_yes_ask
-            max_gain_yes = (max_yes_bid - first_yes_ask) / first_yes_ask
-
-            entry_cents = int(first_yes_ask * 100)
+            entry_cents = int(round(entry_mid * 100))
             bucket = (entry_cents // 10) * 10
             bucket_key = f"{bucket}-{bucket+10}"
 
-            if yes_change > 0.02:
+            if change > 0.02:
                 results["price_range_outcomes"][bucket_key]["up"] += 1
                 results["asset_outcomes"][asset]["up"] += 1
-            elif yes_change < -0.02:
+            elif change < -0.02:
                 results["price_range_outcomes"][bucket_key]["down"] += 1
                 results["asset_outcomes"][asset]["down"] += 1
             else:
                 results["price_range_outcomes"][bucket_key]["flat"] += 1
                 results["asset_outcomes"][asset]["flat"] += 1
 
-            results["price_range_outcomes"][bucket_key]["avg_move"].append(yes_change)
-            results["asset_outcomes"][asset]["avg_move"].append(yes_change)
+            results["price_range_outcomes"][bucket_key]["avg_move"].append(change)
+            results["asset_outcomes"][asset]["avg_move"].append(change)
 
-            if max_gain_yes > 0.10:
+        # Check if buying YES at first mid would have been profitable at peak
+        first_mid = _mid_price(snaps[0], "yes")
+        max_mid = max(_mid_price(s, "yes") for s in snaps)
+        if first_mid > 0:
+            max_gain = (max_mid - first_mid) / first_mid
+            if max_gain > 0.10:
                 results["profitable_if_bought_yes"].append({
                     "ticker": ticker, "asset": asset,
-                    "entry": first_yes_ask, "max": max_yes_bid,
-                    "gain": max_gain_yes,
+                    "entry": first_mid, "max": max_mid,
+                    "gain": max_gain,
                 })
 
-        # NO price movement
-        if first_no_ask > 0:
-            no_change = (last_no_bid - first_no_ask) / first_no_ask
-            max_gain_no = (max_no_bid - first_no_ask) / first_no_ask
+        # --- NO side: same consecutive mid-price approach ---
+        for i in range(len(snaps) - 1):
+            entry_mid = _mid_price(snaps[i], "no")
+            exit_mid = _mid_price(snaps[i + 1], "no")
+            if entry_mid <= 0:
+                continue
 
-            no_entry_cents = int(first_no_ask * 100)
-            no_bucket = (no_entry_cents // 10) * 10
-            no_bucket_key = f"{no_bucket}-{no_bucket+10}"
+            change = (exit_mid - entry_mid) / entry_mid
 
-            # Track NO side outcomes in same structures
-            if no_change > 0.02:
-                results["price_range_outcomes"][no_bucket_key]["up"] += 1
-            elif no_change < -0.02:
-                results["price_range_outcomes"][no_bucket_key]["down"] += 1
+            entry_cents = int(round(entry_mid * 100))
+            bucket = (entry_cents // 10) * 10
+            bucket_key = f"{bucket}-{bucket+10}"
+
+            if change > 0.02:
+                results["price_range_outcomes"][bucket_key]["up"] += 1
+            elif change < -0.02:
+                results["price_range_outcomes"][bucket_key]["down"] += 1
             else:
-                results["price_range_outcomes"][no_bucket_key]["flat"] += 1
+                results["price_range_outcomes"][bucket_key]["flat"] += 1
 
-            results["price_range_outcomes"][no_bucket_key]["avg_move"].append(no_change)
+            results["price_range_outcomes"][bucket_key]["avg_move"].append(change)
 
-            if max_gain_no > 0.10:
+        first_no_mid = _mid_price(snaps[0], "no")
+        max_no_mid = max(_mid_price(s, "no") for s in snaps)
+        if first_no_mid > 0:
+            max_gain = (max_no_mid - first_no_mid) / first_no_mid
+            if max_gain > 0.10:
                 results["profitable_if_bought_no"].append({
                     "ticker": ticker, "asset": asset,
-                    "entry": first_no_ask, "max": max_no_bid,
-                    "gain": max_gain_no,
+                    "entry": first_no_mid, "max": max_no_mid,
+                    "gain": max_gain,
                 })
-
-        # Skip the old hypothetical profit block (handled above)
-        continue
 
     logger.info(f"Analyzed {len(by_ticker)} unique markets — "
                 f"{len(results['profitable_if_bought_yes'])} YES opportunities, "
@@ -266,44 +288,48 @@ def analyze_missed_opportunities() -> Dict[str, Any]:
 
         asset = snaps[0]["asset"]
 
-        # Check YES side
-        first_yes_ask = snaps[0]["yes_ask"] or 0
-        if first_yes_ask > 0:
-            max_yes_bid = max((s["yes_bid"] or 0) for s in snaps)
-            yes_entry_cents = int(first_yes_ask * 100)
-            yes_gain = (max_yes_bid - first_yes_ask) / first_yes_ask
+        # Check YES side using mid-prices to avoid spread bias
+        entry_mid = _mid_price(snaps[0], "yes")
+        if entry_mid > 0:
+            max_mid = max(_mid_price(s, "yes") for s in snaps)
+            last_mid = _mid_price(snaps[-1], "yes")
+            entry_cents = int(round(entry_mid * 100))
+            max_gain = (max_mid - entry_mid) / entry_mid
+            final_change = (last_mid - entry_mid) / entry_mid
 
-            if 20 <= yes_entry_cents <= 80:
-                if yes_gain > 0.20:
+            if 20 <= entry_cents <= 80:
+                if max_gain > 0.20:
                     missed_wins.append({
                         "ticker": ticker, "asset": asset, "side": "yes",
-                        "entry": first_yes_ask, "max": max_yes_bid,
-                        "gain_pct": yes_gain, "entry_cents": yes_entry_cents,
+                        "entry": entry_mid, "max": max_mid,
+                        "gain_pct": max_gain, "entry_cents": entry_cents,
                     })
-                elif yes_gain < -0.10:
+                elif final_change < -0.10:
                     correct_passes.append({
                         "ticker": ticker, "asset": asset, "side": "yes",
-                        "entry": first_yes_ask, "loss_pct": yes_gain,
+                        "entry": entry_mid, "loss_pct": final_change,
                     })
 
-        # Check NO side
-        first_no_ask = snaps[0].get("no_ask") or 0
-        if first_no_ask > 0:
-            max_no_bid = max((s.get("no_bid") or 0) for s in snaps)
-            no_entry_cents = int(first_no_ask * 100)
-            no_gain = (max_no_bid - first_no_ask) / first_no_ask if first_no_ask > 0 else 0
+        # Check NO side using mid-prices
+        entry_no_mid = _mid_price(snaps[0], "no")
+        if entry_no_mid > 0:
+            max_no_mid = max(_mid_price(s, "no") for s in snaps)
+            last_no_mid = _mid_price(snaps[-1], "no")
+            no_entry_cents = int(round(entry_no_mid * 100))
+            no_max_gain = (max_no_mid - entry_no_mid) / entry_no_mid
+            no_final_change = (last_no_mid - entry_no_mid) / entry_no_mid
 
             if 20 <= no_entry_cents <= 80:
-                if no_gain > 0.20:
+                if no_max_gain > 0.20:
                     missed_wins.append({
                         "ticker": ticker, "asset": asset, "side": "no",
-                        "entry": first_no_ask, "max": max_no_bid,
-                        "gain_pct": no_gain, "entry_cents": no_entry_cents,
+                        "entry": entry_no_mid, "max": max_no_mid,
+                        "gain_pct": no_max_gain, "entry_cents": no_entry_cents,
                     })
-                elif no_gain < -0.10:
+                elif no_final_change < -0.10:
                     correct_passes.append({
                         "ticker": ticker, "asset": asset, "side": "no",
-                        "entry": first_no_ask, "loss_pct": no_gain,
+                        "entry": entry_no_mid, "loss_pct": no_final_change,
                     })
 
     missed_yes = sum(1 for m in missed_wins if m["side"] == "yes")
@@ -366,7 +392,12 @@ def analyze_trades() -> Dict[str, Any]:
 # Analysis 4: Sentiment vs actual outcomes
 # ---------------------------------------------------------------------------
 def analyze_sentiment_effectiveness() -> Dict[str, Any]:
-    """When sentiment was positive, did prices actually go up?"""
+    """When sentiment was positive, did prices actually go up within the next hour?
+
+    For each sentiment reading, finds the average contract mid-price in the
+    30 minutes BEFORE vs 30-60 minutes AFTER. This measures whether the
+    sentiment signal had any predictive value for short-term price direction.
+    """
     cutoff = get_cutoff_date()
 
     sentiments = query_db(
@@ -379,43 +410,56 @@ def analyze_sentiment_effectiveness() -> Dict[str, Any]:
     if not sentiments:
         return {}
 
-    # For each sentiment reading, check if prices moved in that direction
-    # within the next hour
     snapshots = query_db(
-        """SELECT asset, yes_bid, timestamp
+        """SELECT asset, yes_bid, yes_ask, timestamp
            FROM market_snapshots WHERE timestamp >= ?
            ORDER BY asset, timestamp""",
         (cutoff,)
     )
 
+    # Index by asset for efficient time-window lookups
     asset_prices = defaultdict(list)
     for s in snapshots:
-        asset_prices[s["asset"]].append(s)
+        mid = ((s["yes_bid"] or 0) + (s["yes_ask"] or 0)) / 2 if (s["yes_bid"] or s["yes_ask"]) else 0
+        if mid > 0:
+            asset_prices[s["asset"]].append({"mid": mid, "ts": s["timestamp"]})
 
     correct_predictions = 0
     wrong_predictions = 0
     total_checked = 0
 
+    # Deduplicate sentiment readings — only check once per asset per hour
+    seen = set()
+
     for sent in sentiments:
         asset = sent["asset"]
         sentiment = sent["overall_sentiment"] or 0
-        if abs(sentiment) < 0.03:  # Too neutral to judge
+        if abs(sentiment) < 0.05:  # Too neutral to judge
             continue
+
+        sent_time = sent["timestamp"]
+        # Dedupe key: asset + hour
+        hour_key = f"{asset}_{sent_time[:13]}"
+        if hour_key in seen:
+            continue
+        seen.add(hour_key)
 
         prices = asset_prices.get(asset, [])
-        if len(prices) < 10:
+        if len(prices) < 5:
             continue
 
-        # Get average price around this sentiment timestamp
-        sent_time = sent["timestamp"]
-        before_prices = [p["yes_bid"] for p in prices[:len(prices)//2] if p["yes_bid"]]
-        after_prices = [p["yes_bid"] for p in prices[len(prices)//2:] if p["yes_bid"]]
+        # Find prices in 30-min window BEFORE and 30-60 min AFTER this reading
+        before_mids = [p["mid"] for p in prices if p["ts"] < sent_time and p["ts"] >= sent_time[:11]]
+        after_mids = [p["mid"] for p in prices if p["ts"] > sent_time]
 
-        if not before_prices or not after_prices:
+        # Use a limited after-window (take next 10 snapshots ≈ next hour)
+        after_mids = after_mids[:10]
+
+        if len(before_mids) < 2 or len(after_mids) < 2:
             continue
 
-        avg_before = np.mean(before_prices)
-        avg_after = np.mean(after_prices)
+        avg_before = np.mean(before_mids)
+        avg_after = np.mean(after_mids)
         price_moved_up = avg_after > avg_before
 
         total_checked += 1
@@ -485,35 +529,48 @@ def analyze_spot_contract_correlation() -> Dict[str, Any]:
         if len(spots) < 5 or len(contracts) < 5:
             continue
 
-        # Compute spot price changes
+        # Build time-indexed maps (keyed by minute: "YYYY-MM-DDTHH:MM")
+        spot_by_minute = {}
+        for s in spots:
+            minute_key = s["timestamp"][:16]
+            spot_by_minute[minute_key] = s["price_usd"]
+
+        contract_by_minute = {}
+        for c in contracts:
+            minute_key = c["timestamp"][:16]
+            contract_by_minute[minute_key] = c["avg_yes_bid"]
+
+        # Find overlapping minutes and compute changes
+        common_minutes = sorted(set(spot_by_minute.keys()) & set(contract_by_minute.keys()))
+        if len(common_minutes) < 5:
+            continue
+
         spot_changes = []
-        for i in range(1, len(spots)):
-            prev = spots[i-1]["price_usd"]
-            curr = spots[i]["price_usd"]
-            if prev and curr and prev > 0:
-                spot_changes.append((curr - prev) / prev)
-
-        # Compute average contract price changes
         contract_changes = []
-        for i in range(1, len(contracts)):
-            prev = contracts[i-1]["avg_yes_bid"]
-            curr = contracts[i]["avg_yes_bid"]
-            if prev and curr and prev > 0:
-                contract_changes.append((curr - prev) / prev)
+        for i in range(1, len(common_minutes)):
+            prev_m = common_minutes[i - 1]
+            curr_m = common_minutes[i]
 
-        # Align to same length and compute correlation
-        min_len = min(len(spot_changes), len(contract_changes))
-        if min_len >= 5:
-            sc = np.array(spot_changes[:min_len])
-            cc = np.array(contract_changes[:min_len])
+            sp = spot_by_minute[prev_m]
+            sc_val = spot_by_minute[curr_m]
+            cp = contract_by_minute[prev_m]
+            cc_val = contract_by_minute[curr_m]
+
+            if sp and sc_val and sp > 0 and cp and cc_val and cp > 0:
+                spot_changes.append((sc_val - sp) / sp)
+                contract_changes.append((cc_val - cp) / cp)
+
+        if len(spot_changes) >= 5:
+            sc = np.array(spot_changes)
+            cc = np.array(contract_changes)
             corr = float(np.corrcoef(sc, cc)[0, 1]) if np.std(sc) > 0 and np.std(cc) > 0 else 0
             correlations[asset] = {
                 "correlation": round(corr, 3),
                 "spot_avg_move": round(float(np.mean(np.abs(sc))), 4),
                 "contract_avg_move": round(float(np.mean(np.abs(cc))), 4),
-                "data_points": min_len,
+                "data_points": len(spot_changes),
             }
-            logger.info(f"{asset} spot-contract correlation: {corr:.3f} ({min_len} data points)")
+            logger.info(f"{asset} spot-contract correlation: {corr:.3f} ({len(spot_changes)} data points)")
 
     return {"correlations": correlations}
 
