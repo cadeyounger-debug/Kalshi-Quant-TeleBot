@@ -419,7 +419,13 @@ class Trader:
             resp = self.api.get_markets(params={"event_ticker": event_ticker, "limit": 200})
             if resp and resp.get("markets"):
                 for m in resp["markets"]:
-                    if m.get("status") == "active" and m.get("yes_bid_dollars", "0.0000") != "0.0000":
+                    if m.get("status") != "active":
+                        continue
+                    ticker = m.get("ticker", "")
+                    has_liquidity = m.get("yes_bid_dollars", "0.0000") != "0.0000"
+                    is_15m = "15M" in ticker.upper()
+                    # Include 15-min contracts even without bids (they open with no liquidity)
+                    if has_liquidity or is_15m:
                         all_markets.append(m)
 
         self._market_cache = all_markets
@@ -625,6 +631,17 @@ class Trader:
             ticker = c['ticker']
             asset = c['asset']
             strike = _parse_strike_from_ticker(ticker)
+
+            # For 15-min contracts, parse target from yes_sub_title
+            # e.g. "Target Price: $67,027.71"
+            if strike <= 0:
+                sub_title = c['market'].get('yes_sub_title', '')
+                target_match = re.search(r'\$([\\d,]+\\.?\\d*)', sub_title)
+                if not target_match:
+                    target_match = re.search(r'[\$]([\d,]+\.?\d*)', sub_title)
+                if target_match:
+                    strike = float(target_match.group(1).replace(',', ''))
+
             if strike <= 0:
                 continue
 
