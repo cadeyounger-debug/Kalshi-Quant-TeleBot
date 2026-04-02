@@ -687,36 +687,34 @@ class Trader:
         positions_to_close = []
 
         for market_id, position in self.current_positions.items():
-            entry = position['entry_price']
-            current = current_prices.get(market_id)
-            if not current:
+            entry = position['entry_price']  # Price we paid (YES or NO cents)
+            yes_price_now = current_prices.get(market_id)
+            if not yes_price_now:
                 continue
+
+            # Convert to the price of the side we hold
+            # _get_market_price_cents returns YES price
+            # If we hold NO, our current price is 100 - YES price
+            if position['side'] == 'yes':
+                current_side_price = yes_price_now
+            else:
+                current_side_price = 100 - yes_price_now
 
             reason = None
             tp_pct = self.model_params.get("take_profit_pct", 0.50)
             sl_pct = self.model_params.get("stop_loss_pct", 0.30)
             time_exit_secs = self.model_params.get("time_exit_seconds", 120)
 
-            # Take profit: sell if price moved enough in our favor
-            if position['side'] == 'yes':
-                gain_pct = (current - entry) / entry if entry > 0 else 0
-                if gain_pct >= tp_pct:
-                    reason = f"Take profit (+{gain_pct:.0%})"
-            else:
-                gain_pct = (entry - current) / entry if entry > 0 else 0
-                if gain_pct >= tp_pct:
-                    reason = f"Take profit (+{gain_pct:.0%})"
+            # Take profit: our side's price went up
+            gain_pct = (current_side_price - entry) / entry if entry > 0 else 0
+            if gain_pct >= tp_pct:
+                reason = f"Take profit (+{gain_pct:.0%})"
 
-            # Stop loss: sell if price moved against us
+            # Stop loss: our side's price went down
             if not reason:
-                if position['side'] == 'yes':
-                    loss_pct = (entry - current) / entry if entry > 0 else 0
-                    if loss_pct >= sl_pct:
-                        reason = f"Stop loss (-{loss_pct:.0%})"
-                else:
-                    loss_pct = (current - entry) / entry if entry > 0 else 0
-                    if loss_pct >= sl_pct:
-                        reason = f"Stop loss (-{loss_pct:.0%})"
+                loss_pct = (entry - current_side_price) / entry if entry > 0 else 0
+                if loss_pct >= sl_pct:
+                    reason = f"Stop loss (-{loss_pct:.0%})"
 
             # Time exit: close before expiration
             if not reason and position.get('expiration_time'):
@@ -744,8 +742,12 @@ class Trader:
                                close_info['current_price'],
                                close_info['reason'])
 
-    def close_position(self, market_id: str, current_price: int, reason: str):
-        """Close a position by selling via the Kalshi API."""
+    def close_position(self, market_id: str, yes_price_now: int, reason: str):
+        """Close a position by selling via the Kalshi API.
+
+        yes_price_now is the current YES price from market data.
+        We sell whichever side we hold.
+        """
         if market_id not in self.current_positions:
             return
 
@@ -755,8 +757,14 @@ class Trader:
         side = position['side']
         title = position.get('title', market_id)
 
+        # Price for our side
+        if side == 'yes':
+            sell_price = yes_price_now
+        else:
+            sell_price = 100 - yes_price_now
+
         try:
-            # To close: sell what we bought
+            # To close: sell the side we bought
             order_payload = {
                 'ticker': market_id,
                 'action': 'sell',
@@ -765,25 +773,22 @@ class Trader:
                 'type': 'market',
             }
             if side == 'yes':
-                order_payload['yes_price'] = current_price
+                order_payload['yes_price'] = sell_price
             else:
-                order_payload['no_price'] = current_price
+                order_payload['no_price'] = sell_price
 
             self.logger.info(f"Closing position: {order_payload}")
             result = self.api.create_order(order_payload)
 
             if result:
-                # Calculate P&L in cents
-                if side == 'yes':
-                    pnl_cents = (current_price - entry) * quantity
-                else:
-                    pnl_cents = (entry - current_price) * quantity
+                # P&L = (sell price - entry price) * quantity, always same logic
+                pnl_cents = (sell_price - entry) * quantity
 
                 pnl_dollars = pnl_cents / 100
 
                 # Record to db
                 self.db.record_trade(
-                    market_id, side=side, quantity=quantity, price=current_price,
+                    market_id, side=side, quantity=quantity, price=sell_price,
                     strategy=position.get('strategy', ''), order_result=f"CLOSE: {reason}",
                     pnl=pnl_dollars,
                 )
@@ -796,11 +801,11 @@ class Trader:
                 self.notifier.send_message(
                     f"🔔 Position Closed\n\n"
                     f"{title}\n"
-                    f"Entry: {entry}¢ → Exit: {current_price}¢\n"
+                    f"{side.upper()} — Entry: {entry}¢ → Exit: {sell_price}¢\n"
                     f"P&L: {pnl_emoji} ${pnl_dollars:.2f}\n"
                     f"Reason: {reason}"
                 )
-                self.logger.info(f"Closed {market_id}: {entry}¢→{current_price}¢, P&L ${pnl_dollars:.2f}, {reason}")
+                self.logger.info(f"Closed {market_id} ({side}): {entry}¢→{sell_price}¢, P&L ${pnl_dollars:.2f}, {reason}")
             else:
                 self.logger.error(f"Failed to close position {market_id}")
 
