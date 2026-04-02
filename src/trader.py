@@ -156,18 +156,21 @@ class Trader:
                         current_price = _get_market_price_cents(market)
 
                         if event_id and current_price:
-                            action = 'buy' if sentiment_decision['direction'] == 'long' else 'sell'
+                            # On Kalshi: long = buy YES, short = buy NO
+                            side = 'yes' if sentiment_decision['direction'] == 'long' else 'no'
+                            trade_price = current_price if side == 'yes' else (100 - current_price)
 
                             # Apply dynamic risk management
                             position_size_fraction = self.risk_manager.calculate_position_size_kelly(sentiment_decision['confidence'])
                             position_value = self.risk_manager.current_bankroll * position_size_fraction
-                            quantity = max(1, int(position_value / current_price))
+                            quantity = max(1, int(position_value / trade_price)) if trade_price > 0 else 1
 
                             trade_decision = {
                                 'event_id': event_id,
-                                'action': action,
+                                'action': 'buy',
+                                'side': side,
                                 'quantity': quantity,
-                                'price': current_price,
+                                'price': trade_price,
                                 'strategy': 'news_sentiment',
                                 'sentiment_score': sentiment_decision['sentiment_score'],
                                 'confidence': sentiment_decision['confidence'],
@@ -242,18 +245,20 @@ class Trader:
                         current_price = _get_market_price_cents(market)
 
                         if event_id and current_price and volatility_decision.get('direction'):
-                            action = 'buy' if volatility_decision['direction'] == 'long' else 'sell'
+                            side = 'yes' if volatility_decision['direction'] == 'long' else 'no'
+                            trade_price = current_price if side == 'yes' else (100 - current_price)
 
                             # Apply dynamic risk management
                             position_size_fraction = self.risk_manager.calculate_position_size_kelly(volatility_decision['confidence'])
                             position_value = self.risk_manager.current_bankroll * position_size_fraction
-                            quantity = max(1, int(position_value / current_price))
+                            quantity = max(1, int(position_value / trade_price)) if trade_price > 0 else 1
 
                             trade_decision = {
                                 'event_id': event_id,
-                                'action': action,
+                                'action': 'buy',
+                                'side': side,
                                 'quantity': quantity,
-                                'price': current_price,
+                                'price': trade_price,
                                 'strategy': 'volatility_based',
                                 'volatility_regime': volatility_decision.get('volatility_regime'),
                                 'confidence': volatility_decision['confidence'],
@@ -514,20 +519,24 @@ class Trader:
         candidates.sort(key=lambda c: c['edge'], reverse=True)
         best = candidates[0]
 
-        action = 'buy' if best['direction'] == 'long' else 'sell'
+        # On Kalshi we always BUY — either YES or NO
+        side = 'yes' if best['direction'] == 'long' else 'no'
+        # NO price = 100 - YES price
+        trade_price = best['price'] if side == 'yes' else (100 - best['price'])
 
-        self.logger.info(f"Value bet fallback: {action} 1 unit of {best['ticker']} "
-                        f"at {best['price']}¢ (edge: {best['edge']:.2f})")
+        self.logger.info(f"Value bet fallback: buy {side.upper()} 1 unit of {best['ticker']} "
+                        f"at {trade_price}¢ (edge: {best['edge']:.2f})")
 
         return {
             'event_id': best['ticker'],
-            'action': action,
-            'quantity': 1,  # Minimum bet — we're here to generate data
-            'price': best['price'],
+            'action': 'buy',
+            'side': side,
+            'quantity': 1,
+            'price': trade_price,
             'strategy': 'value_bet',
-            'confidence': 0.5 + best['edge'],  # Simple confidence from price distance
+            'confidence': 0.5 + best['edge'],
             'title': best['market'].get('title', best['ticker']),
-            'reason': f"Price at {best['price']}¢ — strong consensus (edge: {best['edge']:.0%})",
+            'reason': f"Buy {side.upper()} at {trade_price}¢ (YES price: {best['price']}¢, edge: {best['edge']:.0%})",
             'expiration_time': best['market'].get('expected_expiration_time') or best['market'].get('expiration_time'),
         }
 
@@ -579,9 +588,9 @@ class Trader:
             trade_id = f"{strategy}_{event_id}_{int(time.time())}"
 
             # Build Kalshi v2 order payload
-            # Under 3¢ → market order (instant fill), 3¢ and above → limit order
-            # Kalshi always requires a price field
-            side = 'yes' if action.lower() == 'buy' else 'no'
+            # On Kalshi we always BUY — either YES or NO side
+            # side comes from trade_decision if set, otherwise derive from action
+            side = trade_decision.get('side', 'yes' if action.lower() == 'buy' else 'no')
             order_type = 'market' if price_cents < 3 else 'limit'
             order_payload = {
                 'ticker': event_id,
