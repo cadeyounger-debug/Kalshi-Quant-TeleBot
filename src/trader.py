@@ -170,6 +170,7 @@ class Trader:
                                 'confidence': sentiment_decision['confidence'],
                                 'title': market.get('title', event_id),
                                 'reason': sentiment_decision['reason'],
+                                'expiration_time': market.get('expected_expiration_time') or market.get('expiration_time'),
                             }
 
                             self.logger.info(f"News sentiment trade decision: {action} {event_id} "
@@ -256,6 +257,7 @@ class Trader:
                                 'signal_type': volatility_decision.get('signal_type'),
                                 'title': market.get('title', event_id),
                                 'reason': volatility_decision.get('reason', 'Volatility signal'),
+                                'expiration_time': market.get('expected_expiration_time') or market.get('expiration_time'),
                             }
 
                             self.logger.info(f"Volatility trade decision: {action} {event_id} "
@@ -354,12 +356,15 @@ class Trader:
         return all_markets
 
     def run_trading_strategy(self):
-        """Main trading loop iteration: fetch all markets, analyse, execute."""
+        """Main trading loop iteration: check exits, fetch markets, analyse, execute."""
         try:
             markets = self._fetch_all_markets()
             if not markets:
                 self.logger.info("No markets returned from API")
                 return
+
+            # Check exits FIRST — take profit, stop loss, time exit
+            self.check_exits(markets)
 
             # Record market snapshots to db
             for m in markets:
@@ -501,6 +506,7 @@ class Trader:
             'confidence': 0.5 + best['edge'],  # Simple confidence from price distance
             'title': best['market'].get('title', best['ticker']),
             'reason': f"Price at {best['price']}¢ — strong consensus (edge: {best['edge']:.0%})",
+            'expiration_time': best['market'].get('expected_expiration_time') or best['market'].get('expiration_time'),
         }
 
     def _pick_best_market(self, markets, direction):
@@ -601,16 +607,17 @@ class Trader:
             )
             self.performance_analytics.record_trade(trade)
 
-            # Store position locally for basic tracking
+            # Store position locally for tracking exits
             self.current_positions[event_id] = {
                 'quantity': quantity,
-                'entry_price': price,
+                'entry_price': price_cents,
+                'side': side,
                 'type': 'long' if action.lower() == 'buy' else 'short',
                 'strategy': strategy,
-                'stop_loss_price': self.risk_manager.calculate_stop_loss_price(
-                    price, action.lower() == 'buy'
-                ),
-                'trade_id': trade_id
+                'trade_id': trade_id,
+                'title': trade_decision.get('title', event_id),
+                'expiration_time': trade_decision.get('expiration_time'),
+                'opened_at': time.time(),
             }
 
             # Send clean trade notification
@@ -629,71 +636,142 @@ class Trader:
             self.logger.error(f"Error executing {strategy} trade for {event_id}: {e}")
             self.notifier.send_error_notification(f"Trade execution error for {event_id}: {e}")
 
-    def check_positions_for_risk_management(self, current_prices: Dict[str, float]):
-        """
-        Check all open positions for stop-loss triggers.
-        """
+    def check_exits(self, markets: List[Dict[str, Any]]):
+        """Check all open positions for take-profit, stop-loss, and time-based exits."""
+        from datetime import datetime, timezone
+
+        if not self.current_positions:
+            return
+
+        # Build price lookup from current market data
+        current_prices = {}
+        market_lookup = {}
+        for m in markets:
+            ticker = m.get('ticker', '')
+            price = _get_market_price_cents(m)
+            if ticker and price:
+                current_prices[ticker] = price
+                market_lookup[ticker] = m
+
         positions_to_close = []
 
         for market_id, position in self.current_positions.items():
-            current_price = current_prices.get(market_id, position['entry_price'])
+            entry = position['entry_price']
+            current = current_prices.get(market_id)
+            if not current:
+                continue
 
-            # Check stop-loss
-            if self.risk_manager.check_stop_loss_trigger(
-                position['entry_price'], current_price, position['type'] == 'long'
-            ):
+            reason = None
+
+            # Take profit: sell if price moved 50%+ in our favor
+            if position['side'] == 'yes':
+                gain_pct = (current - entry) / entry if entry > 0 else 0
+                if gain_pct >= 0.50:
+                    reason = f"Take profit (+{gain_pct:.0%})"
+            else:  # no side — profit when yes price drops
+                gain_pct = (entry - current) / entry if entry > 0 else 0
+                if gain_pct >= 0.50:
+                    reason = f"Take profit (+{gain_pct:.0%})"
+
+            # Stop loss: sell if price moved 30%+ against us
+            if not reason:
+                if position['side'] == 'yes':
+                    loss_pct = (entry - current) / entry if entry > 0 else 0
+                    if loss_pct >= 0.30:
+                        reason = f"Stop loss (-{loss_pct:.0%})"
+                else:
+                    loss_pct = (current - entry) / entry if entry > 0 else 0
+                    if loss_pct >= 0.30:
+                        reason = f"Stop loss (-{loss_pct:.0%})"
+
+            # Time exit: close 2 minutes before expiration
+            if not reason and position.get('expiration_time'):
+                try:
+                    exp_str = position['expiration_time']
+                    if exp_str.endswith('Z'):
+                        exp_str = exp_str[:-1] + '+00:00'
+                    exp_time = datetime.fromisoformat(exp_str)
+                    now = datetime.now(timezone.utc)
+                    seconds_left = (exp_time - now).total_seconds()
+                    if 0 < seconds_left < 120:  # Less than 2 minutes
+                        reason = f"Time exit ({int(seconds_left)}s before expiry)"
+                except Exception:
+                    pass
+
+            if reason:
                 positions_to_close.append({
                     'market_id': market_id,
-                    'exit_price': current_price,
-                    'reason': 'stop_loss_triggered'
+                    'current_price': current,
+                    'reason': reason,
                 })
 
-        # Close positions that hit stop-loss
         for close_info in positions_to_close:
-            self.close_position_simple(close_info['market_id'],
-                                     close_info['exit_price'],
-                                     close_info['reason'])
+            self.close_position(close_info['market_id'],
+                               close_info['current_price'],
+                               close_info['reason'])
 
-    def close_position_simple(self, market_id: str, exit_price: float, reason: str):
-        """
-        Close a position with simple P&L calculation.
-        """
+    def close_position(self, market_id: str, current_price: int, reason: str):
+        """Close a position by selling via the Kalshi API."""
         if market_id not in self.current_positions:
             return
 
         position = self.current_positions[market_id]
-
-        # Calculate P&L
-        entry_price = position['entry_price']
         quantity = position['quantity']
+        entry = position['entry_price']
+        side = position['side']
+        title = position.get('title', market_id)
 
-        if position['type'] == 'long':
-            pnl = (exit_price - entry_price) * quantity
-        else:  # short
-            pnl = (entry_price - exit_price) * quantity
+        try:
+            # To close: sell what we bought
+            order_payload = {
+                'ticker': market_id,
+                'action': 'sell',
+                'side': side,
+                'count': quantity,
+                'type': 'market',
+            }
+            if side == 'yes':
+                order_payload['yes_price'] = current_price
+            else:
+                order_payload['no_price'] = current_price
 
-        # Update bankroll
-        self.risk_manager.current_bankroll += pnl
+            self.logger.info(f"Closing position: {order_payload}")
+            result = self.api.create_order(order_payload)
 
-        # Record trade closure in performance analytics
-        trade_id = position.get('trade_id')
-        if trade_id:
-            self.performance_analytics.close_trade(trade_id, exit_price, reason)
+            if result:
+                # Calculate P&L in cents
+                if side == 'yes':
+                    pnl_cents = (current_price - entry) * quantity
+                else:
+                    pnl_cents = (entry - current_price) * quantity
 
-        # Remove from positions
-        del self.current_positions[market_id]
+                pnl_dollars = pnl_cents / 100
 
-        # Send clean close notification
-        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-        self.notifier.send_message(
-            f"🔔 Position Closed\n\n"
-            f"{market_id}\n"
-            f"Exit @ ${exit_price:.2f}\n"
-            f"P&L: {pnl_emoji} ${pnl:.2f}\n"
-            f"Reason: {reason}"
-        )
+                # Record to db
+                self.db.record_trade(
+                    market_id, side=side, quantity=quantity, price=current_price,
+                    strategy=position.get('strategy', ''), order_result=f"CLOSE: {reason}",
+                    pnl=pnl_dollars,
+                )
 
-        self.logger.info(f"Closed position {market_id}: P&L ${pnl:.2f}, reason: {reason}")
+                # Remove position
+                del self.current_positions[market_id]
+
+                # Notify
+                pnl_emoji = "🟢" if pnl_dollars >= 0 else "🔴"
+                self.notifier.send_message(
+                    f"🔔 Position Closed\n\n"
+                    f"{title}\n"
+                    f"Entry: {entry}¢ → Exit: {current_price}¢\n"
+                    f"P&L: {pnl_emoji} ${pnl_dollars:.2f}\n"
+                    f"Reason: {reason}"
+                )
+                self.logger.info(f"Closed {market_id}: {entry}¢→{current_price}¢, P&L ${pnl_dollars:.2f}, {reason}")
+            else:
+                self.logger.error(f"Failed to close position {market_id}")
+
+        except Exception as e:
+            self.logger.error(f"Error closing position {market_id}: {e}")
 
     def get_portfolio_status(self):
         """
