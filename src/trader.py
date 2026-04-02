@@ -504,29 +504,43 @@ class Trader:
         if fallback_positions >= 2:
             return None
 
-        # Find 15-minute contracts
+        # Find tradeable contracts — prefer 15-min, fall back to others
         contracts_15m = []
+        contracts_other = []
+        mp = self.model_params
+        min_price = mp.get("min_entry_price_cents", 20)
+        max_price = mp.get("max_entry_price_cents", 80)
+
         for m in markets:
             ticker = m.get('ticker') or m.get('id')
             if not ticker or ticker in self.current_positions:
-                continue
-            if '15M' not in ticker.upper():
                 continue
             yes_price = _get_market_price_cents(m)
             no_price = _get_no_price_cents(m)
             if not yes_price or yes_price <= 0:
                 continue
+            # Skip markets outside our price range
+            if yes_price < min_price or yes_price > max_price:
+                continue
             asset = extract_asset(ticker)
-            contracts_15m.append({
+            entry = {
                 'market': m,
                 'ticker': ticker,
                 'yes_price': yes_price,
                 'no_price': no_price,
                 'asset': asset,
-            })
+            }
+            if '15M' in ticker.upper():
+                contracts_15m.append(entry)
+            else:
+                contracts_other.append(entry)
 
-        if not contracts_15m:
+        # Use 15-min if available, otherwise fall back to other short-term
+        contracts = contracts_15m if contracts_15m else contracts_other
+        if not contracts:
             return None
+
+        is_15m = bool(contracts_15m)
 
         # Run prediction for each asset and find the best trade
         best_trade = None
@@ -538,26 +552,39 @@ class Trader:
             if not prediction["should_trade"]:
                 continue
 
-            # Find a 15-min contract for this asset
-            asset_contracts = [c for c in contracts_15m if c['asset'] == asset]
+            asset_contracts = [c for c in contracts if c['asset'] == asset]
             if not asset_contracts:
                 continue
 
-            # Pick the contract (usually just one per asset per 15-min window)
+            # For 15-min "up or down" contracts: prediction drives YES/NO
+            # For other contracts: use prediction + contract price to pick side
             contract = asset_contracts[0]
 
-            # Prediction says UP → buy YES, DOWN → buy NO
-            if prediction["direction"] == "up":
-                side = "yes"
-                trade_price = contract["yes_price"]
+            if is_15m:
+                # 15-min: UP → YES, DOWN → NO
+                if prediction["direction"] == "up":
+                    side = "yes"
+                    trade_price = contract["yes_price"]
+                else:
+                    side = "no"
+                    trade_price = contract["no_price"]
             else:
-                side = "no"
-                trade_price = contract["no_price"]
+                # Other contracts: buy the cheaper side if prediction aligns
+                buy_yes_below = mp.get("buy_yes_below", 45)
+                buy_no_above = mp.get("buy_no_above", 55)
+                yes_p = contract["yes_price"]
+                if yes_p < buy_yes_below and prediction["direction"] == "up":
+                    side = "yes"
+                    trade_price = yes_p
+                elif yes_p > buy_no_above and prediction["direction"] == "down":
+                    side = "no"
+                    trade_price = contract["no_price"]
+                else:
+                    continue  # Prediction doesn't align with price edge
 
             if not trade_price or trade_price <= 0:
                 continue
 
-            # Combined confidence: prediction confidence + contract pricing edge
             confidence = prediction["confidence"]
 
             if confidence > best_confidence:
@@ -571,7 +598,7 @@ class Trader:
                 }
 
         if not best_trade:
-            self.logger.info("Value bet: no confident predictions for 15-min contracts")
+            self.logger.info("Value bet: no confident predictions")
             return None
 
         c = best_trade['contract']
@@ -593,7 +620,7 @@ class Trader:
             'strategy': 'value_bet',
             'confidence': p['confidence'],
             'title': c['market'].get('title', c['ticker']),
-            'reason': f"Model predicts {best_trade['asset']} {p['direction'].upper()} ({p['confidence']:.0%}): {reasons_str}",
+            'reason': f"{'15-min' if is_15m else 'Short-term'} {best_trade['asset']} — Model predicts {p['direction'].upper()} ({p['confidence']:.0%}): {reasons_str}",
             'expiration_time': c['market'].get('expected_expiration_time') or c['market'].get('expiration_time'),
         }
 
