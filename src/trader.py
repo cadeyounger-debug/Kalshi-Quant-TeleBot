@@ -529,10 +529,10 @@ class Trader:
         if not markets:
             return None
 
-        # Rate limit: max 1 value bet per hour
+        # Rate limit: max 1 value bet per 5 minutes (matches 15-min contract cycle)
         if not hasattr(self, '_last_value_bet_time'):
             self._last_value_bet_time = 0
-        if time.time() - self._last_value_bet_time < 3600:
+        if time.time() - self._last_value_bet_time < 300:
             return None
 
         # Don't stack positions
