@@ -167,7 +167,9 @@ class Trader:
                                 'price': current_price,
                                 'strategy': 'news_sentiment',
                                 'sentiment_score': sentiment_decision['sentiment_score'],
-                                'confidence': sentiment_decision['confidence']
+                                'confidence': sentiment_decision['confidence'],
+                                'title': market.get('title', event_id),
+                                'reason': sentiment_decision['reason'],
                             }
 
                             self.logger.info(f"News sentiment trade decision: {action} {event_id} "
@@ -251,7 +253,9 @@ class Trader:
                                 'strategy': 'volatility_based',
                                 'volatility_regime': volatility_decision.get('volatility_regime'),
                                 'confidence': volatility_decision['confidence'],
-                                'signal_type': volatility_decision.get('signal_type')
+                                'signal_type': volatility_decision.get('signal_type'),
+                                'title': market.get('title', event_id),
+                                'reason': volatility_decision.get('reason', 'Volatility signal'),
                             }
 
                             self.logger.info(f"Volatility trade decision: {action} {event_id} "
@@ -502,6 +506,8 @@ class Trader:
             'price': best['price'],
             'strategy': 'value_bet',
             'confidence': 0.5 + best['edge'],  # Simple confidence from price distance
+            'title': best['market'].get('title', best['ticker']),
+            'reason': f"Price at {best['price']}¢ — strong consensus (edge: {best['edge']:.0%})",
         }
 
     def _pick_best_market(self, markets, direction):
@@ -609,9 +615,16 @@ class Trader:
                 'trade_id': trade_id
             }
 
-            # Send notification
-            self.notifier.send_trade_notification(
-                f"{strategy.upper()}: {action.upper()} {quantity} units of {event_id} at ${price:.2f}"
+            # Send clean trade notification
+            title = trade_decision.get('title', event_id)
+            reason = trade_decision.get('reason', strategy)
+            price_dollars = f"${price_cents / 100:.2f}"
+            self.notifier.send_message(
+                f"🔔 Trade Opened\n\n"
+                f"{title}\n"
+                f"{side.upper()} {quantity} contract{'s' if quantity > 1 else ''} @ {price_dollars}\n"
+                f"Strategy: {strategy}\n"
+                f"Reason: {reason}"
             )
 
         except Exception as e:
@@ -672,9 +685,14 @@ class Trader:
         # Remove from positions
         del self.current_positions[market_id]
 
-        # Send notification
-        self.notifier.send_trade_notification(
-            f"RISK MANAGEMENT: Closed {market_id} at ${exit_price:.2f}, P&L: ${pnl:.2f} ({reason})"
+        # Send clean close notification
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        self.notifier.send_message(
+            f"🔔 Position Closed\n\n"
+            f"{market_id}\n"
+            f"Exit @ ${exit_price:.2f}\n"
+            f"P&L: {pnl_emoji} ${pnl:.2f}\n"
+            f"Reason: {reason}"
         )
 
         self.logger.info(f"Closed position {market_id}: P&L ${pnl:.2f}, reason: {reason}")

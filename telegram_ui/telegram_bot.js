@@ -352,17 +352,8 @@ Use the inline keyboard below for quick access to common functions.
                 try {
                     const msg = JSON.parse(raw);
                     if (msg.type === 'bot_stopped') {
-                        this.sendAlert(`🚨 *ALERT: Trading bot crashed!*\nExit code: ${msg.code}\nTime: ${msg.timestamp}`);
+                        this.sendAlert(`🚨 *ALERT: Trading bot crashed!*\nExit code: ${msg.code}\nTime: ${new Date().toLocaleString()}`);
                         this._ws = null;
-                    }
-                    if (msg.type === 'bot_error' && msg.data && msg.data.includes('ORDER PLACED')) {
-                        this.sendAlert(`🔔 *Trade Executed*\n${msg.data}`);
-                    }
-                    if (msg.type === 'bot_output' && msg.data && msg.data.includes('ORDER PLACED')) {
-                        this.sendAlert(`🔔 *Trade Executed*\n${msg.data}`);
-                    }
-                    if (msg.type === 'bot_output' && msg.data && msg.data.includes('Closed position')) {
-                        this.sendAlert(`🔔 *Position Closed*\n${msg.data}`);
                     }
                 } catch (e) {}
             });
