@@ -119,7 +119,7 @@ def analyze_price_movements() -> Dict[str, Any]:
     cutoff = get_cutoff_date()
 
     rows = query_db(
-        """SELECT ticker, asset, yes_bid, yes_ask, timestamp
+        """SELECT ticker, asset, yes_bid, yes_ask, no_bid, no_ask, timestamp
            FROM market_snapshots
            WHERE timestamp >= ?
            ORDER BY ticker, timestamp""",
@@ -147,45 +147,78 @@ def analyze_price_movements() -> Dict[str, Any]:
             continue
 
         asset = snaps[0]["asset"]
-        first_ask = snaps[0]["yes_ask"] or 0
-        last_bid = snaps[-1]["yes_bid"] or 0
-        max_bid = max((s["yes_bid"] or 0) for s in snaps)
-        min_ask = min((s["yes_ask"] or 0) for s in snaps) if any(s["yes_ask"] for s in snaps) else 0
 
-        if first_ask <= 0:
-            continue
+        # --- YES side analysis ---
+        first_yes_ask = snaps[0]["yes_ask"] or 0
+        last_yes_bid = snaps[-1]["yes_bid"] or 0
+        max_yes_bid = max((s["yes_bid"] or 0) for s in snaps)
 
-        # Price movement as fraction of entry
-        price_change = (last_bid - first_ask) / first_ask if first_ask > 0 else 0
-        max_gain_yes = (max_bid - first_ask) / first_ask if first_ask > 0 else 0
+        # --- NO side analysis ---
+        first_no_ask = snaps[0].get("no_ask") or 0
+        last_no_bid = snaps[-1].get("no_bid") or 0
+        max_no_bid = max((s.get("no_bid") or 0) for s in snaps)
 
-        # Bucket by entry price range (in cents)
-        entry_cents = int(first_ask * 100)
-        bucket = (entry_cents // 10) * 10  # 0-10, 10-20, 20-30, etc.
-        bucket_key = f"{bucket}-{bucket+10}"
+        # YES price movement
+        if first_yes_ask > 0:
+            yes_change = (last_yes_bid - first_yes_ask) / first_yes_ask
+            max_gain_yes = (max_yes_bid - first_yes_ask) / first_yes_ask
 
-        if price_change > 0.02:
-            results["price_range_outcomes"][bucket_key]["up"] += 1
-            results["asset_outcomes"][asset]["up"] += 1
-        elif price_change < -0.02:
-            results["price_range_outcomes"][bucket_key]["down"] += 1
-            results["asset_outcomes"][asset]["down"] += 1
-        else:
-            results["price_range_outcomes"][bucket_key]["flat"] += 1
-            results["asset_outcomes"][asset]["flat"] += 1
+            entry_cents = int(first_yes_ask * 100)
+            bucket = (entry_cents // 10) * 10
+            bucket_key = f"{bucket}-{bucket+10}"
 
-        results["price_range_outcomes"][bucket_key]["avg_move"].append(price_change)
-        results["asset_outcomes"][asset]["avg_move"].append(price_change)
+            if yes_change > 0.02:
+                results["price_range_outcomes"][bucket_key]["up"] += 1
+                results["asset_outcomes"][asset]["up"] += 1
+            elif yes_change < -0.02:
+                results["price_range_outcomes"][bucket_key]["down"] += 1
+                results["asset_outcomes"][asset]["down"] += 1
+            else:
+                results["price_range_outcomes"][bucket_key]["flat"] += 1
+                results["asset_outcomes"][asset]["flat"] += 1
 
-        # Track hypothetical profit
-        if max_gain_yes > 0.10:  # Would have gained 10%+
-            results["profitable_if_bought_yes"].append({
-                "ticker": ticker, "asset": asset,
-                "entry": first_ask, "max": max_bid,
-                "gain": max_gain_yes,
-            })
+            results["price_range_outcomes"][bucket_key]["avg_move"].append(yes_change)
+            results["asset_outcomes"][asset]["avg_move"].append(yes_change)
 
-    logger.info(f"Analyzed {len(by_ticker)} unique markets")
+            if max_gain_yes > 0.10:
+                results["profitable_if_bought_yes"].append({
+                    "ticker": ticker, "asset": asset,
+                    "entry": first_yes_ask, "max": max_yes_bid,
+                    "gain": max_gain_yes,
+                })
+
+        # NO price movement
+        if first_no_ask > 0:
+            no_change = (last_no_bid - first_no_ask) / first_no_ask
+            max_gain_no = (max_no_bid - first_no_ask) / first_no_ask
+
+            no_entry_cents = int(first_no_ask * 100)
+            no_bucket = (no_entry_cents // 10) * 10
+            no_bucket_key = f"{no_bucket}-{no_bucket+10}"
+
+            # Track NO side outcomes in same structures
+            if no_change > 0.02:
+                results["price_range_outcomes"][no_bucket_key]["up"] += 1
+            elif no_change < -0.02:
+                results["price_range_outcomes"][no_bucket_key]["down"] += 1
+            else:
+                results["price_range_outcomes"][no_bucket_key]["flat"] += 1
+
+            results["price_range_outcomes"][no_bucket_key]["avg_move"].append(no_change)
+
+            if max_gain_no > 0.10:
+                results["profitable_if_bought_no"].append({
+                    "ticker": ticker, "asset": asset,
+                    "entry": first_no_ask, "max": max_no_bid,
+                    "gain": max_gain_no,
+                })
+
+        # Skip the old hypothetical profit block (handled above)
+        continue
+
+    logger.info(f"Analyzed {len(by_ticker)} unique markets — "
+                f"{len(results['profitable_if_bought_yes'])} YES opportunities, "
+                f"{len(results['profitable_if_bought_no'])} NO opportunities")
     return results
 
 
@@ -214,7 +247,7 @@ def analyze_missed_opportunities() -> Dict[str, Any]:
 
     # For each market we saw, get price trajectory
     all_snapshots = query_db(
-        """SELECT ticker, asset, yes_bid, yes_ask, timestamp
+        """SELECT ticker, asset, yes_bid, yes_ask, no_bid, no_ask, timestamp
            FROM market_snapshots WHERE timestamp >= ?
            ORDER BY ticker, timestamp""",
         (cutoff,)
@@ -232,32 +265,50 @@ def analyze_missed_opportunities() -> Dict[str, Any]:
             continue
 
         asset = snaps[0]["asset"]
-        first_ask = snaps[0]["yes_ask"] or 0
-        if first_ask <= 0:
-            continue
 
-        max_bid = max((s["yes_bid"] or 0) for s in snaps)
-        min_bid = min((s["yes_bid"] or 0) for s in snaps)
+        # Check YES side
+        first_yes_ask = snaps[0]["yes_ask"] or 0
+        if first_yes_ask > 0:
+            max_yes_bid = max((s["yes_bid"] or 0) for s in snaps)
+            yes_entry_cents = int(first_yes_ask * 100)
+            yes_gain = (max_yes_bid - first_yes_ask) / first_yes_ask
 
-        # If buying YES would have been profitable (could have sold at max)
-        entry_cents = int(first_ask * 100)
-        hypothetical_gain_yes = (max_bid - first_ask) / first_ask if first_ask > 0 else 0
+            if 20 <= yes_entry_cents <= 80:
+                if yes_gain > 0.20:
+                    missed_wins.append({
+                        "ticker": ticker, "asset": asset, "side": "yes",
+                        "entry": first_yes_ask, "max": max_yes_bid,
+                        "gain_pct": yes_gain, "entry_cents": yes_entry_cents,
+                    })
+                elif yes_gain < -0.10:
+                    correct_passes.append({
+                        "ticker": ticker, "asset": asset, "side": "yes",
+                        "entry": first_yes_ask, "loss_pct": yes_gain,
+                    })
 
-        if 20 <= entry_cents <= 80:  # Only count markets in our tradeable range
-            if hypothetical_gain_yes > 0.20:  # >20% gain possible
-                missed_wins.append({
-                    "ticker": ticker, "asset": asset,
-                    "entry": first_ask, "max": max_bid,
-                    "gain_pct": hypothetical_gain_yes,
-                    "entry_cents": entry_cents,
-                })
-            elif hypothetical_gain_yes < -0.10:
-                correct_passes.append({
-                    "ticker": ticker, "asset": asset,
-                    "entry": first_ask, "loss_pct": hypothetical_gain_yes,
-                })
+        # Check NO side
+        first_no_ask = snaps[0].get("no_ask") or 0
+        if first_no_ask > 0:
+            max_no_bid = max((s.get("no_bid") or 0) for s in snaps)
+            no_entry_cents = int(first_no_ask * 100)
+            no_gain = (max_no_bid - first_no_ask) / first_no_ask if first_no_ask > 0 else 0
 
-    logger.info(f"Missed opportunities: {len(missed_wins)} wins we could have had, "
+            if 20 <= no_entry_cents <= 80:
+                if no_gain > 0.20:
+                    missed_wins.append({
+                        "ticker": ticker, "asset": asset, "side": "no",
+                        "entry": first_no_ask, "max": max_no_bid,
+                        "gain_pct": no_gain, "entry_cents": no_entry_cents,
+                    })
+                elif no_gain < -0.10:
+                    correct_passes.append({
+                        "ticker": ticker, "asset": asset, "side": "no",
+                        "entry": first_no_ask, "loss_pct": no_gain,
+                    })
+
+    missed_yes = sum(1 for m in missed_wins if m["side"] == "yes")
+    missed_no = sum(1 for m in missed_wins if m["side"] == "no")
+    logger.info(f"Missed opportunities: {len(missed_wins)} wins ({missed_yes} YES, {missed_no} NO), "
                 f"{len(correct_passes)} correct passes")
 
     return {

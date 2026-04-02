@@ -42,9 +42,14 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     title       TEXT,
     yes_bid     REAL,
     yes_ask     REAL,
+    no_bid      REAL,
+    no_ask      REAL,
     volume      INTEGER,
     timestamp   TEXT NOT NULL
 );
+
+-- Add no_bid/no_ask columns if upgrading from older schema
+
 
 CREATE TABLE IF NOT EXISTS trade_decisions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +120,12 @@ class TradingDB:
         # Create tables on init.
         with self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
+            # Migrate: add no_bid/no_ask if missing
+            try:
+                conn.execute("SELECT no_bid FROM market_snapshots LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE market_snapshots ADD COLUMN no_bid REAL")
+                conn.execute("ALTER TABLE market_snapshots ADD COLUMN no_ask REAL")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10)
@@ -132,6 +143,8 @@ class TradingDB:
         title: str = None,
         yes_bid: float = None,
         yes_ask: float = None,
+        no_bid: float = None,
+        no_ask: float = None,
         volume: int = None,
         asset: str = None,
         timestamp: str = None,
@@ -141,9 +154,9 @@ class TradingDB:
         with self._lock:
             with self._connect() as conn:
                 cur = conn.execute(
-                    "INSERT INTO market_snapshots (ticker, asset, title, yes_bid, yes_ask, volume, timestamp) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (ticker, asset, title, yes_bid, yes_ask, volume, timestamp),
+                    "INSERT INTO market_snapshots (ticker, asset, title, yes_bid, yes_ask, no_bid, no_ask, volume, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ticker, asset, title, yes_bid, yes_ask, no_bid, no_ask, volume, timestamp),
                 )
                 return cur.lastrowid
 

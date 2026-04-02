@@ -411,6 +411,8 @@ class Trader:
                     title=m.get("title", ""),
                     yes_bid=float(m.get("yes_bid_dollars", 0) or 0),
                     yes_ask=float(m.get("yes_ask_dollars", 0) or 0),
+                    no_bid=float(m.get("no_bid_dollars", 0) or 0),
+                    no_ask=float(m.get("no_ask_dollars", 0) or 0),
                     volume=float(m.get("volume_24h_fp", 0) or 0),
                 )
 
