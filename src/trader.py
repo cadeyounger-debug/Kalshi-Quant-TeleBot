@@ -14,34 +14,51 @@ from settings_manager import SettingsManager
 from db import TradingDB
 from retrain import load_current_params, PARAMS_PATH
 
-def _get_market_price_cents(market: Dict[str, Any]) -> float:
-    """Extract market price in cents from Kalshi v2 market data.
+def _dollar_to_cents(val) -> int:
+    """Convert a dollar string like '0.5000' to cents (50)."""
+    try:
+        d = float(val)
+        return round(d * 100) if d > 0 else 0
+    except (ValueError, TypeError):
+        return 0
 
-    Kalshi v2 returns prices as dollar strings (e.g. "0.5000" = 50 cents).
-    Falls back to legacy fields for compatibility.
-    Returns price in cents (1-99) or 0 if unavailable.
-    """
-    # Kalshi v2: dollar string fields
-    for field in ('yes_ask_dollars', 'yes_bid_dollars', 'no_bid_dollars'):
+
+def _get_market_price_cents(market: Dict[str, Any]) -> int:
+    """Extract YES price in cents from Kalshi v2 market data."""
+    for field in ('yes_ask_dollars', 'yes_bid_dollars'):
         val = market.get(field)
-        if val is not None:
-            try:
-                dollars = float(val)
-                if dollars > 0:
-                    return round(dollars * 100)  # Convert to cents
-            except (ValueError, TypeError):
-                continue
+        c = _dollar_to_cents(val)
+        if c > 0:
+            return c
 
-    # Legacy / streamer fields (already in cents or 0-1 range)
+    # Legacy / streamer fields
     for field in ('yes_ask', 'last_price', 'current_price'):
         val = market.get(field)
         if val is not None:
             try:
                 v = float(val)
                 if v > 0:
-                    return v if v > 1 else round(v * 100)
+                    return int(v) if v > 1 else round(v * 100)
             except (ValueError, TypeError):
                 continue
+
+    return 0
+
+
+def _get_no_price_cents(market: Dict[str, Any]) -> int:
+    """Extract actual NO price in cents from Kalshi v2 market data.
+
+    Uses the real no_ask/no_bid fields — does NOT assume 100 - yes_price.
+    """
+    for field in ('no_ask_dollars', 'no_bid_dollars'):
+        val = market.get(field)
+        c = _dollar_to_cents(val)
+        if c > 0:
+            return c
+
+    # Fallback: if no NO price fields, estimate from YES
+    yes = _get_market_price_cents(market)
+    return max(100 - yes, 1) if yes > 0 else 0
 
     return 0
 
@@ -158,7 +175,7 @@ class Trader:
                         if event_id and current_price:
                             # On Kalshi: long = buy YES, short = buy NO
                             side = 'yes' if sentiment_decision['direction'] == 'long' else 'no'
-                            trade_price = current_price if side == 'yes' else (100 - current_price)
+                            trade_price = current_price if side == 'yes' else _get_no_price_cents(market)
 
                             # Apply dynamic risk management
                             position_size_fraction = self.risk_manager.calculate_position_size_kelly(sentiment_decision['confidence'])
@@ -246,7 +263,7 @@ class Trader:
 
                         if event_id and current_price and volatility_decision.get('direction'):
                             side = 'yes' if volatility_decision['direction'] == 'long' else 'no'
-                            trade_price = current_price if side == 'yes' else (100 - current_price)
+                            trade_price = current_price if side == 'yes' else _get_no_price_cents(market)
 
                             # Apply dynamic risk management
                             position_size_fraction = self.risk_manager.calculate_position_size_kelly(volatility_decision['confidence'])
@@ -521,8 +538,7 @@ class Trader:
 
         # On Kalshi we always BUY — either YES or NO
         side = 'yes' if best['direction'] == 'long' else 'no'
-        # NO price = 100 - YES price
-        trade_price = best['price'] if side == 'yes' else (100 - best['price'])
+        trade_price = best['price'] if side == 'yes' else _get_no_price_cents(best['market'])
 
         self.logger.info(f"Value bet fallback: buy {side.upper()} 1 unit of {best['ticker']} "
                         f"at {trade_price}¢ (edge: {best['edge']:.2f})")
@@ -675,30 +691,28 @@ class Trader:
             return
 
         # Build price lookup from current market data
-        current_prices = {}
         market_lookup = {}
         for m in markets:
             ticker = m.get('ticker', '')
-            price = _get_market_price_cents(m)
-            if ticker and price:
-                current_prices[ticker] = price
+            if ticker:
                 market_lookup[ticker] = m
 
         positions_to_close = []
 
         for market_id, position in self.current_positions.items():
             entry = position['entry_price']  # Price we paid (YES or NO cents)
-            yes_price_now = current_prices.get(market_id)
-            if not yes_price_now:
+            m = market_lookup.get(market_id)
+            if not m:
                 continue
 
-            # Convert to the price of the side we hold
-            # _get_market_price_cents returns YES price
-            # If we hold NO, our current price is 100 - YES price
+            # Get actual current price for the side we hold
             if position['side'] == 'yes':
-                current_side_price = yes_price_now
+                current_side_price = _get_market_price_cents(m)
             else:
-                current_side_price = 100 - yes_price_now
+                current_side_price = _get_no_price_cents(m)
+
+            if not current_side_price:
+                continue
 
             reason = None
             tp_pct = self.model_params.get("take_profit_pct", 0.50)
@@ -733,20 +747,19 @@ class Trader:
             if reason:
                 positions_to_close.append({
                     'market_id': market_id,
-                    'current_price': current,
+                    'market': m,
                     'reason': reason,
                 })
 
         for close_info in positions_to_close:
             self.close_position(close_info['market_id'],
-                               close_info['current_price'],
+                               close_info['market'],
                                close_info['reason'])
 
-    def close_position(self, market_id: str, yes_price_now: int, reason: str):
+    def close_position(self, market_id: str, market: Dict[str, Any], reason: str):
         """Close a position by selling via the Kalshi API.
 
-        yes_price_now is the current YES price from market data.
-        We sell whichever side we hold.
+        Uses actual market bid prices for the side we hold.
         """
         if market_id not in self.current_positions:
             return
@@ -757,11 +770,11 @@ class Trader:
         side = position['side']
         title = position.get('title', market_id)
 
-        # Price for our side
+        # Get actual sell price for our side (use bid — that's what we can sell at)
         if side == 'yes':
-            sell_price = yes_price_now
+            sell_price = _dollar_to_cents(market.get('yes_bid_dollars')) or _get_market_price_cents(market)
         else:
-            sell_price = 100 - yes_price_now
+            sell_price = _dollar_to_cents(market.get('no_bid_dollars')) or _get_no_price_cents(market)
 
         try:
             # To close: sell the side we bought
