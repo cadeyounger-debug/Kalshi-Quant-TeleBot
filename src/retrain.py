@@ -2,17 +2,23 @@
 """
 Daily retraining script for the Kalshi trading bot.
 
-Runs every morning at 7am. Analyzes the last 3 months of trading data
-(or all available data if less than 3 months) and outputs updated
-model parameters to model_params.json.
+Runs every morning at 7am. Analyzes ALL data — not just trades we made,
+but every market we observed. This includes:
 
-What it learns:
-- Entry price range (what buy prices lead to profits?)
-- Take-profit threshold (when is the best time to sell winners?)
-- Stop-loss threshold (when to cut losers?)
-- Strategy weights (which strategies actually make money?)
-- Time-of-day patterns (when are trades most profitable?)
-- Asset preferences (which assets perform best?)
+1. PRICE MOVEMENTS — For every market snapshot, what happened next?
+   Did the price go up, down, or stay flat? At what price ranges do
+   markets tend to move the most?
+
+2. MISSED OPPORTUNITIES — Markets we saw but didn't trade. If we had
+   bought YES at 30¢ and it went to 60¢, that's a missed win. If we
+   had bought at 30¢ and it went to 10¢, we correctly avoided it.
+
+3. ACTUAL TRADES — What we traded, what happened, P&L.
+
+4. SENTIMENT vs OUTCOMES — When sentiment was positive, did prices
+   actually go up? Calibrates whether news signal is useful.
+
+Outputs model_params.json consumed by the trader each cycle.
 """
 
 import json
@@ -21,43 +27,37 @@ import os
 import sqlite3
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Default params used when there's not enough data
 DEFAULT_PARAMS = {
     "version": 0,
     "trained_at": None,
     "data_points": 0,
-    # Entry filters
     "min_entry_price_cents": 20,
     "max_entry_price_cents": 80,
-    "min_edge": 0.05,  # Minimum distance from center (45-55¢ dead zone)
-    "buy_yes_below": 45,  # Buy YES when price below this
-    "buy_no_above": 55,   # Buy NO when price above this
-    # Exit thresholds
+    "min_edge": 0.05,
+    "buy_yes_below": 45,
+    "buy_no_above": 55,
     "take_profit_pct": 0.50,
     "stop_loss_pct": 0.30,
     "time_exit_seconds": 120,
-    # Strategy weights (0 = disabled, 1 = normal, >1 = preferred)
     "strategy_weights": {
         "news_sentiment": 1.0,
         "statistical_arbitrage": 1.0,
         "volatility_based": 1.0,
         "value_bet": 1.0,
     },
-    # Asset preferences
     "asset_weights": {
         "BTC": 1.0,
         "ETH": 1.0,
         "SOL": 1.0,
     },
-    # Sentiment
     "sentiment_threshold": 0.6,
     "min_sentiment_confidence": 0.2,
-    # Max concurrent positions
     "max_positions": 3,
 }
 
@@ -73,7 +73,6 @@ DB_PATH = os.environ.get(
 
 
 def load_current_params() -> Dict[str, Any]:
-    """Load current model params or return defaults."""
     try:
         with open(PARAMS_PATH) as f:
             return json.load(f)
@@ -82,14 +81,12 @@ def load_current_params() -> Dict[str, Any]:
 
 
 def save_params(params: Dict[str, Any]):
-    """Save updated params to disk."""
     with open(PARAMS_PATH, 'w') as f:
         json.dump(params, f, indent=2, default=str)
     logger.info(f"Saved model params to {PARAMS_PATH}")
 
 
 def query_db(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    """Run a query against the trading database."""
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -103,31 +100,191 @@ def query_db(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
 
 
 def get_cutoff_date() -> str:
-    """Get the cutoff date (3 months ago or earliest data)."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=90)
     return cutoff.isoformat()
 
 
-def analyze_trades() -> Dict[str, Any]:
-    """Analyze completed trades to learn what works."""
+# ---------------------------------------------------------------------------
+# Analysis 1: Price movements across ALL observed markets
+# ---------------------------------------------------------------------------
+def analyze_price_movements() -> Dict[str, Any]:
+    """For each market ticker, track how the price changed over time.
+
+    Groups snapshots by ticker, computes:
+    - Price at first observation vs last observation
+    - Max price seen, min price seen
+    - Whether buying YES at the first price would have been profitable
+    - Which price ranges had the most upward vs downward movement
+    """
     cutoff = get_cutoff_date()
 
+    rows = query_db(
+        """SELECT ticker, asset, yes_bid, yes_ask, timestamp
+           FROM market_snapshots
+           WHERE timestamp >= ?
+           ORDER BY ticker, timestamp""",
+        (cutoff,)
+    )
+
+    if not rows:
+        return {"total_markets_observed": 0}
+
+    # Group by ticker
+    by_ticker = defaultdict(list)
+    for r in rows:
+        by_ticker[r["ticker"]].append(r)
+
+    results = {
+        "total_markets_observed": len(by_ticker),
+        "profitable_if_bought_yes": [],  # (ticker, asset, entry_price, max_price, gain%)
+        "profitable_if_bought_no": [],
+        "price_range_outcomes": defaultdict(lambda: {"up": 0, "down": 0, "flat": 0, "avg_move": []}),
+        "asset_outcomes": defaultdict(lambda: {"up": 0, "down": 0, "flat": 0, "avg_move": []}),
+    }
+
+    for ticker, snaps in by_ticker.items():
+        if len(snaps) < 2:
+            continue
+
+        asset = snaps[0]["asset"]
+        first_ask = snaps[0]["yes_ask"] or 0
+        last_bid = snaps[-1]["yes_bid"] or 0
+        max_bid = max((s["yes_bid"] or 0) for s in snaps)
+        min_ask = min((s["yes_ask"] or 0) for s in snaps) if any(s["yes_ask"] for s in snaps) else 0
+
+        if first_ask <= 0:
+            continue
+
+        # Price movement as fraction of entry
+        price_change = (last_bid - first_ask) / first_ask if first_ask > 0 else 0
+        max_gain_yes = (max_bid - first_ask) / first_ask if first_ask > 0 else 0
+
+        # Bucket by entry price range (in cents)
+        entry_cents = int(first_ask * 100)
+        bucket = (entry_cents // 10) * 10  # 0-10, 10-20, 20-30, etc.
+        bucket_key = f"{bucket}-{bucket+10}"
+
+        if price_change > 0.02:
+            results["price_range_outcomes"][bucket_key]["up"] += 1
+            results["asset_outcomes"][asset]["up"] += 1
+        elif price_change < -0.02:
+            results["price_range_outcomes"][bucket_key]["down"] += 1
+            results["asset_outcomes"][asset]["down"] += 1
+        else:
+            results["price_range_outcomes"][bucket_key]["flat"] += 1
+            results["asset_outcomes"][asset]["flat"] += 1
+
+        results["price_range_outcomes"][bucket_key]["avg_move"].append(price_change)
+        results["asset_outcomes"][asset]["avg_move"].append(price_change)
+
+        # Track hypothetical profit
+        if max_gain_yes > 0.10:  # Would have gained 10%+
+            results["profitable_if_bought_yes"].append({
+                "ticker": ticker, "asset": asset,
+                "entry": first_ask, "max": max_bid,
+                "gain": max_gain_yes,
+            })
+
+    logger.info(f"Analyzed {len(by_ticker)} unique markets")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Analysis 2: Missed opportunities
+# ---------------------------------------------------------------------------
+def analyze_missed_opportunities() -> Dict[str, Any]:
+    """Compare trade decisions (what we considered) with actual outcomes.
+
+    For markets we saw but didn't trade — would trading have been profitable?
+    """
+    cutoff = get_cutoff_date()
+
+    # Get all trade decisions (including should_trade=False)
+    decisions = query_db(
+        """SELECT * FROM trade_decisions WHERE timestamp >= ?""",
+        (cutoff,)
+    )
+
+    # Get actual trades
+    trades = query_db(
+        """SELECT market_ticker FROM trades WHERE timestamp >= ?""",
+        (cutoff,)
+    )
+    traded_tickers = set(t["market_ticker"] for t in trades)
+
+    # For each market we saw, get price trajectory
+    all_snapshots = query_db(
+        """SELECT ticker, asset, yes_bid, yes_ask, timestamp
+           FROM market_snapshots WHERE timestamp >= ?
+           ORDER BY ticker, timestamp""",
+        (cutoff,)
+    )
+
+    price_trajectories = defaultdict(list)
+    for s in all_snapshots:
+        price_trajectories[s["ticker"]].append(s)
+
+    missed_wins = []
+    correct_passes = []
+
+    for ticker, snaps in price_trajectories.items():
+        if len(snaps) < 3 or ticker in traded_tickers:
+            continue
+
+        asset = snaps[0]["asset"]
+        first_ask = snaps[0]["yes_ask"] or 0
+        if first_ask <= 0:
+            continue
+
+        max_bid = max((s["yes_bid"] or 0) for s in snaps)
+        min_bid = min((s["yes_bid"] or 0) for s in snaps)
+
+        # If buying YES would have been profitable (could have sold at max)
+        entry_cents = int(first_ask * 100)
+        hypothetical_gain_yes = (max_bid - first_ask) / first_ask if first_ask > 0 else 0
+
+        if 20 <= entry_cents <= 80:  # Only count markets in our tradeable range
+            if hypothetical_gain_yes > 0.20:  # >20% gain possible
+                missed_wins.append({
+                    "ticker": ticker, "asset": asset,
+                    "entry": first_ask, "max": max_bid,
+                    "gain_pct": hypothetical_gain_yes,
+                    "entry_cents": entry_cents,
+                })
+            elif hypothetical_gain_yes < -0.10:
+                correct_passes.append({
+                    "ticker": ticker, "asset": asset,
+                    "entry": first_ask, "loss_pct": hypothetical_gain_yes,
+                })
+
+    logger.info(f"Missed opportunities: {len(missed_wins)} wins we could have had, "
+                f"{len(correct_passes)} correct passes")
+
+    return {
+        "missed_wins": missed_wins,
+        "correct_passes": correct_passes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Analysis 3: Actual trades
+# ---------------------------------------------------------------------------
+def analyze_trades() -> Dict[str, Any]:
+    cutoff = get_cutoff_date()
     trades = query_db(
         "SELECT * FROM trades WHERE timestamp >= ? ORDER BY timestamp",
         (cutoff,)
     )
 
     if not trades:
-        logger.info("No trades found for analysis")
-        return {}
+        return {"total_trades": 0}
 
     results = {
         "total_trades": len(trades),
-        "by_strategy": {},
-        "by_asset": {},
+        "by_strategy": defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0, "count": 0}),
+        "by_asset": defaultdict(lambda: {"wins": 0, "losses": 0, "total_pnl": 0, "count": 0}),
         "profitable_entry_prices": [],
         "losing_entry_prices": [],
-        "exits_with_pnl": [],
     }
 
     for t in trades:
@@ -135,215 +292,320 @@ def analyze_trades() -> Dict[str, Any]:
         asset = t.get("asset", "UNKNOWN")
         pnl = t.get("pnl")
         price = t.get("price", 0)
-        order_result = t.get("order_result", "")
 
-        # Track by strategy
-        if strategy not in results["by_strategy"]:
-            results["by_strategy"][strategy] = {"wins": 0, "losses": 0, "total_pnl": 0, "count": 0}
         results["by_strategy"][strategy]["count"] += 1
-
-        if pnl is not None:
-            results["by_strategy"][strategy]["total_pnl"] += pnl
-            if pnl > 0:
-                results["by_strategy"][strategy]["wins"] += 1
-                results["profitable_entry_prices"].append(price)
-            elif pnl < 0:
-                results["by_strategy"][strategy]["losses"] += 1
-                results["losing_entry_prices"].append(price)
-            results["exits_with_pnl"].append({"pnl": pnl, "price": price, "strategy": strategy, "asset": asset})
-
-        # Track by asset
-        if asset not in results["by_asset"]:
-            results["by_asset"][asset] = {"wins": 0, "losses": 0, "total_pnl": 0, "count": 0}
         results["by_asset"][asset]["count"] += 1
-        if pnl is not None:
+
+        if pnl is not None and pnl != 0:
+            results["by_strategy"][strategy]["total_pnl"] += pnl
             results["by_asset"][asset]["total_pnl"] += pnl
             if pnl > 0:
+                results["by_strategy"][strategy]["wins"] += 1
                 results["by_asset"][asset]["wins"] += 1
-            elif pnl < 0:
+                results["profitable_entry_prices"].append(price)
+            else:
+                results["by_strategy"][strategy]["losses"] += 1
                 results["by_asset"][asset]["losses"] += 1
+                results["losing_entry_prices"].append(price)
 
     return results
 
 
-def analyze_snapshots() -> Dict[str, Any]:
-    """Analyze market snapshots for price patterns."""
-    cutoff = get_cutoff_date()
-
-    # Get snapshot counts and price distributions
-    stats = query_db(
-        """SELECT asset, COUNT(*) as count,
-           AVG(yes_bid) as avg_bid, AVG(yes_ask) as avg_ask,
-           AVG(volume) as avg_volume
-           FROM market_snapshots WHERE timestamp >= ?
-           GROUP BY asset""",
-        (cutoff,)
-    )
-
-    return {"snapshot_stats": stats}
-
-
-def analyze_sentiment() -> Dict[str, Any]:
-    """Analyze sentiment data effectiveness."""
+# ---------------------------------------------------------------------------
+# Analysis 4: Sentiment vs actual outcomes
+# ---------------------------------------------------------------------------
+def analyze_sentiment_effectiveness() -> Dict[str, Any]:
+    """When sentiment was positive, did prices actually go up?"""
     cutoff = get_cutoff_date()
 
     sentiments = query_db(
-        """SELECT asset, overall_sentiment, confidence, article_count
-           FROM news_sentiment WHERE timestamp >= ?""",
+        """SELECT asset, overall_sentiment, confidence, timestamp
+           FROM news_sentiment WHERE timestamp >= ?
+           ORDER BY timestamp""",
         (cutoff,)
     )
 
     if not sentiments:
         return {}
 
-    avg_sentiment = np.mean([s["overall_sentiment"] for s in sentiments if s["overall_sentiment"]])
-    avg_confidence = np.mean([s["confidence"] for s in sentiments if s["confidence"]])
+    # For each sentiment reading, check if prices moved in that direction
+    # within the next hour
+    snapshots = query_db(
+        """SELECT asset, yes_bid, timestamp
+           FROM market_snapshots WHERE timestamp >= ?
+           ORDER BY asset, timestamp""",
+        (cutoff,)
+    )
+
+    asset_prices = defaultdict(list)
+    for s in snapshots:
+        asset_prices[s["asset"]].append(s)
+
+    correct_predictions = 0
+    wrong_predictions = 0
+    total_checked = 0
+
+    for sent in sentiments:
+        asset = sent["asset"]
+        sentiment = sent["overall_sentiment"] or 0
+        if abs(sentiment) < 0.03:  # Too neutral to judge
+            continue
+
+        prices = asset_prices.get(asset, [])
+        if len(prices) < 10:
+            continue
+
+        # Get average price around this sentiment timestamp
+        sent_time = sent["timestamp"]
+        before_prices = [p["yes_bid"] for p in prices[:len(prices)//2] if p["yes_bid"]]
+        after_prices = [p["yes_bid"] for p in prices[len(prices)//2:] if p["yes_bid"]]
+
+        if not before_prices or not after_prices:
+            continue
+
+        avg_before = np.mean(before_prices)
+        avg_after = np.mean(after_prices)
+        price_moved_up = avg_after > avg_before
+
+        total_checked += 1
+        if (sentiment > 0 and price_moved_up) or (sentiment < 0 and not price_moved_up):
+            correct_predictions += 1
+        else:
+            wrong_predictions += 1
+
+    accuracy = correct_predictions / total_checked if total_checked > 0 else 0.5
+    logger.info(f"Sentiment accuracy: {accuracy:.0%} ({correct_predictions}/{total_checked})")
 
     return {
-        "avg_sentiment": float(avg_sentiment),
-        "avg_confidence": float(avg_confidence),
-        "total_records": len(sentiments),
+        "accuracy": accuracy,
+        "total_checked": total_checked,
+        "correct": correct_predictions,
+        "wrong": wrong_predictions,
     }
 
 
-def compute_optimal_params(trade_analysis: Dict, snapshot_analysis: Dict, sentiment_analysis: Dict) -> Dict[str, Any]:
-    """Compute optimal parameters from the analysis."""
+# ---------------------------------------------------------------------------
+# Compute optimal params from ALL analyses
+# ---------------------------------------------------------------------------
+def compute_optimal_params(
+    price_analysis: Dict,
+    missed_analysis: Dict,
+    trade_analysis: Dict,
+    sentiment_analysis: Dict,
+) -> Dict[str, Any]:
     params = DEFAULT_PARAMS.copy()
     params["trained_at"] = datetime.now(timezone.utc).isoformat()
+    params["version"] = load_current_params().get("version", 0) + 1
 
+    total_markets = price_analysis.get("total_markets_observed", 0)
     total_trades = trade_analysis.get("total_trades", 0)
-    params["data_points"] = total_trades
+    params["data_points"] = total_markets
 
-    if total_trades < 5:
-        logger.info(f"Only {total_trades} trades — using defaults with minor adjustments")
-        # Even with few trades, we can start learning
-        if total_trades > 0:
-            params["version"] = load_current_params().get("version", 0) + 1
+    if total_markets < 10:
+        logger.info(f"Only {total_markets} market observations — using defaults")
         return params
 
-    # --- Learn entry price range ---
-    profitable_prices = trade_analysis.get("profitable_entry_prices", [])
-    losing_prices = trade_analysis.get("losing_entry_prices", [])
-
-    if profitable_prices:
-        # Expand the entry range toward where profits happen
-        p10 = max(int(np.percentile(profitable_prices, 10)), 10)
-        p90 = min(int(np.percentile(profitable_prices, 90)), 90)
-        params["min_entry_price_cents"] = p10
-        params["max_entry_price_cents"] = p90
-        logger.info(f"Learned entry range: {p10}¢ - {p90}¢")
-
-    # --- Learn take-profit and stop-loss ---
-    exits = trade_analysis.get("exits_with_pnl", [])
-    if exits:
-        profitable_exits = [e for e in exits if e["pnl"] and e["pnl"] > 0]
-        losing_exits = [e for e in exits if e["pnl"] and e["pnl"] < 0]
-
-        if profitable_exits:
-            # Average gain as fraction — use this to set take-profit
-            avg_gain = np.mean([e["pnl"] for e in profitable_exits])
-            # Don't be too greedy or too conservative
-            tp = min(max(avg_gain * 2, 0.20), 0.80)
-            params["take_profit_pct"] = round(float(tp), 2)
-            logger.info(f"Learned take-profit: {tp:.0%}")
-
-        if losing_exits:
-            avg_loss = abs(np.mean([e["pnl"] for e in losing_exits]))
-            # Tighten stop-loss if losses are big
-            sl = min(max(avg_loss * 1.5, 0.15), 0.50)
-            params["stop_loss_pct"] = round(float(sl), 2)
-            logger.info(f"Learned stop-loss: {sl:.0%}")
-
-    # --- Learn strategy weights ---
-    by_strategy = trade_analysis.get("by_strategy", {})
-    strategy_weights = {}
-    for strategy, stats in by_strategy.items():
-        count = stats["count"]
-        if count < 2:
-            strategy_weights[strategy] = 1.0
+    # --- Learn entry price range from ALL market movements ---
+    price_range_outcomes = price_analysis.get("price_range_outcomes", {})
+    best_ranges = []
+    for range_key, stats in price_range_outcomes.items():
+        total = stats["up"] + stats["down"] + stats["flat"]
+        if total < 3:
             continue
+        win_rate = stats["up"] / total
+        avg_move = np.mean(stats["avg_move"]) if stats["avg_move"] else 0
+        best_ranges.append((range_key, win_rate, avg_move, total))
 
-        win_rate = stats["wins"] / count if count > 0 else 0.5
-        avg_pnl = stats["total_pnl"] / count if count > 0 else 0
+    if best_ranges:
+        # Sort by win rate, find the ranges with best outcomes
+        best_ranges.sort(key=lambda x: x[1], reverse=True)
+        logger.info("Price range outcomes:")
+        for r, wr, am, n in best_ranges:
+            logger.info(f"  {r}¢: win_rate={wr:.0%}, avg_move={am:.1%}, n={n}")
 
-        # Weight = win_rate * 2, clamped to 0.2-3.0
-        weight = min(max(win_rate * 2, 0.2), 3.0)
+        # Set entry range to cover the top-performing price ranges
+        good_ranges = [r for r, wr, am, n in best_ranges if wr > 0.40 and n >= 3]
+        if good_ranges:
+            # Parse range strings like "20-30" to get min/max
+            all_mins = []
+            all_maxs = []
+            for r in good_ranges:
+                parts = r.split("-")
+                all_mins.append(int(parts[0]))
+                all_maxs.append(int(parts[1]))
+            params["min_entry_price_cents"] = max(min(all_mins), 5)
+            params["max_entry_price_cents"] = min(max(all_maxs), 95)
+            logger.info(f"Learned entry range: {params['min_entry_price_cents']}-{params['max_entry_price_cents']}¢")
 
-        # Boost strategies with positive PnL
-        if avg_pnl > 0:
-            weight *= 1.2
-        elif avg_pnl < 0:
-            weight *= 0.8
+    # --- Learn from missed opportunities ---
+    missed_wins = missed_analysis.get("missed_wins", [])
+    if missed_wins:
+        # What entry prices did we miss that would have been profitable?
+        missed_entry_prices = [m["entry_cents"] for m in missed_wins]
+        missed_assets = defaultdict(int)
+        for m in missed_wins:
+            missed_assets[m["asset"]] += 1
 
-        strategy_weights[strategy] = round(float(weight), 2)
-        logger.info(f"Strategy {strategy}: win_rate={win_rate:.0%}, avg_pnl=${avg_pnl:.2f}, weight={weight:.2f}")
+        logger.info(f"Missed {len(missed_wins)} profitable opportunities:")
+        for asset, count in missed_assets.items():
+            logger.info(f"  {asset}: {count} missed wins")
 
-    if strategy_weights:
-        params["strategy_weights"] = {**DEFAULT_PARAMS["strategy_weights"], **strategy_weights}
+        # If we're missing wins in a price range, expand our entry range
+        if missed_entry_prices:
+            p25 = int(np.percentile(missed_entry_prices, 25))
+            p75 = int(np.percentile(missed_entry_prices, 75))
+            # Nudge our range toward where we're missing wins
+            current_min = params["min_entry_price_cents"]
+            current_max = params["max_entry_price_cents"]
+            params["min_entry_price_cents"] = max(min(current_min, p25), 5)
+            params["max_entry_price_cents"] = min(max(current_max, p75), 95)
 
-    # --- Learn asset preferences ---
-    by_asset = trade_analysis.get("by_asset", {})
-    asset_weights = {}
-    for asset, stats in by_asset.items():
-        count = stats["count"]
-        if count < 2:
-            asset_weights[asset] = 1.0
-            continue
+        # Boost asset weights for assets with more missed wins
+        total_missed = sum(missed_assets.values())
+        if total_missed > 0:
+            for asset, count in missed_assets.items():
+                # More missed wins = we should trade this asset more
+                boost = 1.0 + (count / total_missed)
+                params["asset_weights"][asset] = round(min(boost, 2.0), 2)
+                logger.info(f"  Boosting {asset} weight to {params['asset_weights'][asset]}")
 
-        win_rate = stats["wins"] / count if count > 0 else 0.5
-        weight = min(max(win_rate * 2, 0.3), 3.0)
-        asset_weights[asset] = round(float(weight), 2)
-        logger.info(f"Asset {asset}: win_rate={win_rate:.0%}, weight={weight:.2f}")
+    # --- Learn from actual trades ---
+    if total_trades >= 3:
+        by_strategy = trade_analysis.get("by_strategy", {})
+        for strategy, stats in by_strategy.items():
+            count = stats["count"]
+            if count < 2:
+                continue
+            win_rate = stats["wins"] / count if count > 0 else 0.5
+            avg_pnl = stats["total_pnl"] / count if count > 0 else 0
 
-    if asset_weights:
-        params["asset_weights"] = {**DEFAULT_PARAMS["asset_weights"], **asset_weights}
+            weight = min(max(win_rate * 2, 0.2), 3.0)
+            if avg_pnl > 0:
+                weight *= 1.2
+            elif avg_pnl < 0:
+                weight *= 0.8
 
-    # --- Learn sentiment threshold ---
-    if sentiment_analysis.get("avg_confidence"):
-        # If average confidence is low, lower the threshold so we still trade
-        avg_conf = sentiment_analysis["avg_confidence"]
-        if avg_conf < 0.3:
+            params["strategy_weights"][strategy] = round(float(weight), 2)
+            logger.info(f"Strategy {strategy}: wr={win_rate:.0%}, pnl=${avg_pnl:.2f}, weight={weight:.2f}")
+
+        # Learn take-profit from actual profitable trades
+        profitable_prices = trade_analysis.get("profitable_entry_prices", [])
+        losing_prices = trade_analysis.get("losing_entry_prices", [])
+
+        by_asset = trade_analysis.get("by_asset", {})
+        for asset, stats in by_asset.items():
+            count = stats["count"]
+            if count < 2:
+                continue
+            win_rate = stats["wins"] / count
+            weight = min(max(win_rate * 2, 0.3), 3.0)
+            # Blend with missed-opportunity weight
+            existing = params["asset_weights"].get(asset, 1.0)
+            params["asset_weights"][asset] = round((existing + weight) / 2, 2)
+
+    # --- Learn from sentiment accuracy ---
+    if sentiment_analysis.get("total_checked", 0) >= 5:
+        accuracy = sentiment_analysis["accuracy"]
+        if accuracy > 0.60:
+            # Sentiment is predictive — lower threshold to use it more
             params["sentiment_threshold"] = 0.3
-            params["min_sentiment_confidence"] = 0.1
-        elif avg_conf < 0.5:
-            params["sentiment_threshold"] = 0.4
             params["min_sentiment_confidence"] = 0.15
+            params["strategy_weights"]["news_sentiment"] = round(min(accuracy * 2, 2.5), 2)
+            logger.info(f"Sentiment is predictive ({accuracy:.0%}) — lowering threshold")
+        elif accuracy < 0.40:
+            # Sentiment is counter-predictive — either flip it or reduce weight
+            params["strategy_weights"]["news_sentiment"] = 0.3
+            logger.info(f"Sentiment is counter-predictive ({accuracy:.0%}) — reducing weight")
+        else:
+            params["strategy_weights"]["news_sentiment"] = 0.8
+            logger.info(f"Sentiment is neutral ({accuracy:.0%}) — slightly reducing weight")
 
-    params["version"] = load_current_params().get("version", 0) + 1
+    # --- Learn optimal exit thresholds from price volatility ---
+    asset_outcomes = price_analysis.get("asset_outcomes", {})
+    all_moves = []
+    for asset, stats in asset_outcomes.items():
+        all_moves.extend(stats.get("avg_move", []))
+
+    if all_moves and len(all_moves) > 20:
+        pos_moves = [m for m in all_moves if m > 0]
+        neg_moves = [abs(m) for m in all_moves if m < 0]
+
+        if pos_moves:
+            # Set take-profit at the 75th percentile of positive moves
+            tp = min(max(float(np.percentile(pos_moves, 75)), 0.15), 0.80)
+            params["take_profit_pct"] = round(tp, 2)
+            logger.info(f"Learned take-profit: {tp:.0%} (from {len(pos_moves)} positive moves)")
+
+        if neg_moves:
+            # Set stop-loss at the 60th percentile of negative moves
+            sl = min(max(float(np.percentile(neg_moves, 60)), 0.10), 0.50)
+            params["stop_loss_pct"] = round(sl, 2)
+            logger.info(f"Learned stop-loss: {sl:.0%} (from {len(neg_moves)} negative moves)")
+
+    # --- Buy/sell thresholds from where price movements are strongest ---
+    # If prices below 40¢ tend to go up, lower the buy_yes_below threshold
+    for range_key, stats in price_range_outcomes.items():
+        parts = range_key.split("-")
+        low = int(parts[0])
+        total = stats["up"] + stats["down"] + stats["flat"]
+        if total < 5:
+            continue
+        win_rate = stats["up"] / total
+
+        if low < 50 and win_rate > 0.55:
+            # This low range has good upward movement — expand YES buying
+            params["buy_yes_below"] = max(params["buy_yes_below"], low + 10)
+        if low >= 50 and win_rate < 0.45:
+            # This high range has downward pressure — expand NO buying
+            params["buy_no_above"] = min(params["buy_no_above"], low)
+
     return params
 
 
 def retrain():
-    """Main retraining pipeline."""
-    logger.info("=" * 50)
-    logger.info("Starting daily model retraining")
+    """Main retraining pipeline — analyzes ALL data, not just trades."""
+    logger.info("=" * 60)
+    logger.info("DAILY MODEL RETRAIN — Analyzing all market data")
     logger.info(f"Database: {DB_PATH}")
-    logger.info(f"Params output: {PARAMS_PATH}")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
 
-    # Check if DB exists
     if not os.path.exists(DB_PATH):
         logger.warning(f"Database not found at {DB_PATH} — saving defaults")
         save_params(DEFAULT_PARAMS)
-        return
+        return DEFAULT_PARAMS
 
-    # Analyze data
+    # Run all analyses
+    logger.info("--- Analyzing price movements across ALL markets ---")
+    price_analysis = analyze_price_movements()
+
+    logger.info("--- Analyzing missed opportunities ---")
+    missed_analysis = analyze_missed_opportunities()
+
+    logger.info("--- Analyzing actual trades ---")
     trade_analysis = analyze_trades()
-    snapshot_analysis = analyze_snapshots()
-    sentiment_analysis = analyze_sentiment()
 
-    # Log summary
-    logger.info(f"Trade analysis: {trade_analysis.get('total_trades', 0)} trades")
-    logger.info(f"Snapshot analysis: {snapshot_analysis}")
-    logger.info(f"Sentiment analysis: {sentiment_analysis}")
+    logger.info("--- Analyzing sentiment effectiveness ---")
+    sentiment_analysis = analyze_sentiment_effectiveness()
 
-    # Compute and save new params
-    new_params = compute_optimal_params(trade_analysis, snapshot_analysis, sentiment_analysis)
+    # Summary
+    logger.info(f"\nSummary:")
+    logger.info(f"  Markets observed: {price_analysis.get('total_markets_observed', 0)}")
+    logger.info(f"  Missed wins: {len(missed_analysis.get('missed_wins', []))}")
+    logger.info(f"  Correct passes: {len(missed_analysis.get('correct_passes', []))}")
+    logger.info(f"  Trades made: {trade_analysis.get('total_trades', 0)}")
+    logger.info(f"  Sentiment accuracy: {sentiment_analysis.get('accuracy', 'N/A')}")
+
+    # Compute and save
+    new_params = compute_optimal_params(
+        price_analysis, missed_analysis, trade_analysis, sentiment_analysis
+    )
     save_params(new_params)
 
-    logger.info(f"Retraining complete — version {new_params['version']}")
-    logger.info(f"Key params: entry={new_params['min_entry_price_cents']}-{new_params['max_entry_price_cents']}¢, "
-                f"TP={new_params['take_profit_pct']:.0%}, SL={new_params['stop_loss_pct']:.0%}")
+    logger.info(f"\nRetrain complete — v{new_params['version']}")
+    logger.info(f"Entry: {new_params['min_entry_price_cents']}-{new_params['max_entry_price_cents']}¢")
+    logger.info(f"TP: {new_params['take_profit_pct']:.0%}, SL: {new_params['stop_loss_pct']:.0%}")
+    logger.info(f"Strategies: {new_params['strategy_weights']}")
+    logger.info(f"Assets: {new_params['asset_weights']}")
 
     return new_params
 
