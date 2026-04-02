@@ -12,6 +12,7 @@ from market_data_streamer import MarketDataStreamer
 from performance_analytics import PerformanceAnalytics, Trade
 from settings_manager import SettingsManager
 from db import TradingDB
+from retrain import load_current_params, PARAMS_PATH
 
 def _get_market_price_cents(market: Dict[str, Any]) -> float:
     """Extract market price in cents from Kalshi v2 market data.
@@ -57,6 +58,8 @@ class Trader:
         self.volatility_analyzer = VolatilityAnalyzer(min_history_points=5)
         self.risk_manager = RiskManager(bankroll)
         self.db = TradingDB()
+        self.model_params = load_current_params()
+        self.logger.info(f"Loaded model params v{self.model_params.get('version', 0)}")
 
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
@@ -355,9 +358,21 @@ class Trader:
         self.logger.info(f"Fetched {len(all_markets)} active BTC/ETH/SOL markets with liquidity")
         return all_markets
 
+    def _reload_model_params(self):
+        """Reload model params if they've been updated by retraining."""
+        try:
+            new_params = load_current_params()
+            if new_params.get("version", 0) != self.model_params.get("version", 0):
+                self.model_params = new_params
+                self.logger.info(f"Reloaded model params v{new_params['version']} "
+                               f"(trained at {new_params.get('trained_at', 'unknown')})")
+        except Exception:
+            pass
+
     def run_trading_strategy(self):
         """Main trading loop iteration: check exits, fetch markets, analyse, execute."""
         try:
+            self._reload_model_params()
             markets = self._fetch_all_markets()
             if not markets:
                 self.logger.info("No markets returned from API")
@@ -443,11 +458,20 @@ class Trader:
             1 for p in self.current_positions.values()
             if p.get('strategy') == 'value_bet'
         )
-        if fallback_positions >= 3:
-            self.logger.info("Value bet fallback: already at 3 positions, skipping")
+        mp = self.model_params
+        max_pos = mp.get("max_positions", 3)
+        if fallback_positions >= max_pos:
+            self.logger.info(f"Value bet fallback: already at {max_pos} positions, skipping")
             return None
 
-        # Score markets by how extreme their price is (closer to 0 or 100 = stronger signal)
+        # Use learned price range and thresholds
+        min_price = mp.get("min_entry_price_cents", 20)
+        max_price = mp.get("max_entry_price_cents", 80)
+        buy_yes_below = mp.get("buy_yes_below", 45)
+        buy_no_above = mp.get("buy_no_above", 55)
+        min_edge = mp.get("min_edge", 0.05)
+        asset_weights = mp.get("asset_weights", {})
+
         candidates = []
         for m in markets:
             ticker = m.get('ticker') or m.get('id')
@@ -458,23 +482,21 @@ class Trader:
             if not yes_price or yes_price <= 0:
                 continue
 
-            # Normalize to 0-1 range (yes_price is in cents)
-            price = yes_price / 100
+            price = yes_price / 100  # Normalize to 0-1
 
-            # We want markets with strong consensus (price far from 0.50)
-            # Only trade markets in the 20¢-80¢ range — real uncertainty, real odds
-            if price < 0.20 or price > 0.80:
+            # Use learned entry range
+            if yes_price < min_price or yes_price > max_price:
                 continue
 
-            # Bet YES on underpriced contracts (20-45¢), NO on overpriced (55-80¢)
-            if price < 0.45:
+            # Use learned buy/sell thresholds
+            if price < (buy_yes_below / 100):
                 direction = 'long'
-                edge = 0.45 - price  # How far below 45¢
-            elif price > 0.55:
+                edge = (buy_yes_below / 100) - price
+            elif price > (buy_no_above / 100):
                 direction = 'short'
-                edge = price - 0.55  # How far above 55¢
+                edge = price - (buy_no_above / 100)
             else:
-                continue  # Skip 45-55¢ — too close to a coin flip
+                continue  # Inside dead zone — no edge
 
             candidates.append({
                 'market': m,
@@ -662,29 +684,32 @@ class Trader:
                 continue
 
             reason = None
+            tp_pct = self.model_params.get("take_profit_pct", 0.50)
+            sl_pct = self.model_params.get("stop_loss_pct", 0.30)
+            time_exit_secs = self.model_params.get("time_exit_seconds", 120)
 
-            # Take profit: sell if price moved 50%+ in our favor
+            # Take profit: sell if price moved enough in our favor
             if position['side'] == 'yes':
                 gain_pct = (current - entry) / entry if entry > 0 else 0
-                if gain_pct >= 0.50:
+                if gain_pct >= tp_pct:
                     reason = f"Take profit (+{gain_pct:.0%})"
-            else:  # no side — profit when yes price drops
+            else:
                 gain_pct = (entry - current) / entry if entry > 0 else 0
-                if gain_pct >= 0.50:
+                if gain_pct >= tp_pct:
                     reason = f"Take profit (+{gain_pct:.0%})"
 
-            # Stop loss: sell if price moved 30%+ against us
+            # Stop loss: sell if price moved against us
             if not reason:
                 if position['side'] == 'yes':
                     loss_pct = (entry - current) / entry if entry > 0 else 0
-                    if loss_pct >= 0.30:
+                    if loss_pct >= sl_pct:
                         reason = f"Stop loss (-{loss_pct:.0%})"
                 else:
                     loss_pct = (current - entry) / entry if entry > 0 else 0
-                    if loss_pct >= 0.30:
+                    if loss_pct >= sl_pct:
                         reason = f"Stop loss (-{loss_pct:.0%})"
 
-            # Time exit: close 2 minutes before expiration
+            # Time exit: close before expiration
             if not reason and position.get('expiration_time'):
                 try:
                     exp_str = position['expiration_time']
@@ -693,7 +718,7 @@ class Trader:
                     exp_time = datetime.fromisoformat(exp_str)
                     now = datetime.now(timezone.utc)
                     seconds_left = (exp_time - now).total_seconds()
-                    if 0 < seconds_left < 120:  # Less than 2 minutes
+                    if 0 < seconds_left < time_exit_secs:
                         reason = f"Time exit ({int(seconds_left)}s before expiry)"
                 except Exception:
                     pass
