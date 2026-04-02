@@ -33,7 +33,7 @@ _ID_MAP = {
 # Our ticker -> CoinGecko id
 _TICKER_TO_ID = {v: k for k, v in _ID_MAP.items()}
 
-_CACHE_TTL = 60  # seconds
+_CACHE_TTL = 120  # seconds — CoinGecko free tier allows ~30 req/min
 
 
 class CryptoPrices:

@@ -16,13 +16,14 @@ class Notifier:
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         logging.basicConfig(level=logging.INFO)
 
-    def send_message(self, message):
+    def send_message(self, message, parse_mode=None):
         try:
             payload = {
                 'chat_id': self.chat_id,
                 'text': message,
-                'parse_mode': 'Markdown'
             }
+            if parse_mode:
+                payload['parse_mode'] = parse_mode
             response = requests.post(self.base_url, json=payload)
             response.raise_for_status()
             logging.info("Message sent successfully: %s", message)
