@@ -128,44 +128,52 @@ class CryptoPrices:
         return self._fetch_from_coingecko()
 
     def _fetch_from_free_crypto(self) -> Optional[Dict[str, Dict[str, Any]]]:
-        """Fetch from FreeCryptoAPI."""
+        """Fetch from FreeCryptoAPI: GET /v1/getData?symbol=BTC+ETH+SOL"""
         try:
-            # FreeCryptoAPI: /price/{symbols}
-            symbols = ",".join(_FREE_CRYPTO_SYMBOLS.values())
-            url = f"{_FREE_CRYPTO_BASE}/price/{symbols}"
+            url = f"{_FREE_CRYPTO_BASE}/getData?symbol=BTC+ETH+SOL"
             headers = {"Authorization": f"Bearer {_FREE_CRYPTO_API_KEY}"}
             resp = self._session.get(url, headers=headers, timeout=10)
             resp.raise_for_status()
             raw = resp.json()
 
             result: Dict[str, Dict[str, Any]] = {}
-            # FreeCryptoAPI response format varies — handle common shapes
             data = raw.get("data", raw)
 
             for symbol in ["BTC", "ETH", "SOL"]:
                 coin_data = None
-                # Try different response formats
                 if isinstance(data, dict):
-                    coin_data = data.get(symbol) or data.get(f"{symbol}/USD") or data.get(symbol.lower())
+                    # Try various key formats
+                    coin_data = (data.get(symbol) or data.get(f"{symbol}/USD")
+                                 or data.get(symbol.lower()))
+                elif isinstance(data, list):
+                    # Might be a list of coin objects
+                    for item in data:
+                        if isinstance(item, dict) and item.get("symbol", "").upper() == symbol:
+                            coin_data = item
+                            break
 
                 if coin_data and isinstance(coin_data, dict):
-                    price = coin_data.get("price") or coin_data.get("value") or coin_data.get("usd")
-                    change = coin_data.get("change_24h") or coin_data.get("percent_change_24h")
+                    price = (coin_data.get("price") or coin_data.get("value")
+                             or coin_data.get("usd") or coin_data.get("rate"))
+                    change = (coin_data.get("change_24h") or coin_data.get("percent_change_24h")
+                              or coin_data.get("change24h"))
                     if price is not None:
                         result[symbol] = {
                             "price": float(price),
                             "change_24h": round(float(change), 4) if change is not None else None,
                         }
                 elif coin_data is not None:
-                    # Maybe it's just a number
                     try:
                         result[symbol] = {"price": float(coin_data), "change_24h": None}
                     except (ValueError, TypeError):
                         pass
 
             if result:
+                logger.info(f"FreeCryptoAPI: got prices for {list(result.keys())}")
                 return result
-            logger.warning("FreeCryptoAPI returned data but couldn't parse prices: %s", str(raw)[:200])
+
+            # Log the raw response so we can debug the format
+            logger.warning("FreeCryptoAPI: couldn't parse prices from: %s", str(raw)[:300])
             return None
 
         except Exception:
