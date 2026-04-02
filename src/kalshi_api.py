@@ -105,8 +105,13 @@ class KalshiAPI:
             except requests.exceptions.HTTPError as http_err:
                 status_code = getattr(http_err.response, "status_code", None)
                 if status_code and 400 <= status_code < 500:
+                    body = ""
+                    try:
+                        body = http_err.response.text
+                    except Exception:
+                        pass
                     self.logger.error(
-                        f"Non-retriable HTTP error ({status_code}) for {endpoint}: {http_err}"
+                        f"Non-retriable HTTP error ({status_code}) for {endpoint}: {http_err} | Body: {body}"
                     )
                     break
                 self.logger.warning(

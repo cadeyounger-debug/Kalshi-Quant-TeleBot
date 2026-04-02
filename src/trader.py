@@ -535,8 +535,8 @@ class Trader:
         price = trade_decision['price']
         strategy = trade_decision.get('strategy', 'unknown')
 
-        # Kalshi prices are in cents (1-99); normalise if needed
-        price_cents = int(price) if price > 1 else int(price * 100)
+        # Price from strategies is already in cents (1-99) via _get_market_price_cents
+        price_cents = int(price)
 
         try:
             # Validate position size
@@ -551,7 +551,7 @@ class Trader:
             # Generate unique trade ID
             trade_id = f"{strategy}_{event_id}_{int(time.time())}"
 
-            # Build Kalshi order payload
+            # Build Kalshi v2 order payload — prices as cent integers
             side = 'yes' if action.lower() == 'buy' else 'no'
             order_payload = {
                 'ticker': event_id,
@@ -564,6 +564,7 @@ class Trader:
             }
             # Remove None values
             order_payload = {k: v for k, v in order_payload.items() if v is not None}
+            self.logger.info(f"Order payload: {order_payload}")
 
             result = self.api.create_order(order_payload)
             if result:
