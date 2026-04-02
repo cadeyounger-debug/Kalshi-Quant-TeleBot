@@ -14,7 +14,7 @@ from settings_manager import SettingsManager
 from db import TradingDB
 from retrain import load_current_params, PARAMS_PATH
 from crypto_prices import get_default as get_crypto_prices
-from price_predictor import predict_direction
+from price_predictor import predict_direction, evaluate_contract
 import re
 
 
@@ -319,7 +319,7 @@ class Trader:
         # Fires when all other strategies produce no signal
         if not trade_decision:
             try:
-                trade_decision = self._value_bet_fallback(market_data)
+                trade_decision = self._value_bet_fallback(market_data, getattr(self, '_current_spot_prices', None))
             except Exception as e:
                 self.logger.error(f"Error in value bet fallback: {e}")
 
@@ -422,6 +422,7 @@ class Trader:
 
             # Fetch and record live crypto spot prices
             spot_prices = self.crypto_prices.get_prices()
+            self._current_spot_prices = spot_prices  # Store for use in strategies
             for asset, data in spot_prices.items():
                 self.db.record_crypto_price(asset, data["price"], data.get("change_24h"))
             if spot_prices:
@@ -512,12 +513,15 @@ class Trader:
                     best["market"] = m
         return best
 
-    def _value_bet_fallback(self, market_data):
+    def _value_bet_fallback(self, market_data, spot_prices=None):
         """
-        Prediction-based value bet on 15-minute BTC/ETH/SOL contracts.
+        Probability-based value bet on BTC/ETH/SOL contracts.
 
-        Uses our price predictor to forecast direction, then bets accordingly.
-        Max 1 bet per hour, only on 15-minute up/down contracts.
+        For each contract, estimates the true probability of the underlying
+        crossing the strike price before expiration using realized volatility.
+        Buys when the market price is significantly below fair value.
+
+        Max 1 bet per hour, prefers 15-minute contracts.
         """
         from db import extract_asset
 
@@ -577,63 +581,57 @@ class Trader:
 
         is_15m = bool(contracts_15m)
 
-        # Run prediction for each asset and find the best trade
+        # Evaluate each contract for mispricing using strike probability model
         best_trade = None
-        best_confidence = 0
+        best_edge = 0
 
-        for asset in ["BTC", "ETH", "SOL"]:
-            prediction = predict_direction(self.db, asset, self.crypto_prices)
-
-            if not prediction["should_trade"]:
+        for c in contracts:
+            ticker = c['ticker']
+            asset = c['asset']
+            strike = _parse_strike_from_ticker(ticker)
+            if strike <= 0:
                 continue
 
-            asset_contracts = [c for c in contracts if c['asset'] == asset]
-            if not asset_contracts:
+            # Get spot price for this asset
+            spot = None
+            if spot_prices and asset in spot_prices:
+                spot = spot_prices[asset].get("price")
+            if not spot:
+                spot = self.crypto_prices.get_price(asset)
+            if not spot:
                 continue
 
-            # For 15-min "up or down" contracts: prediction drives YES/NO
-            # For other contracts: use prediction + contract price to pick side
-            contract = asset_contracts[0]
+            exp_time = c['market'].get('expected_expiration_time') or c['market'].get('expiration_time')
 
-            if is_15m:
-                # 15-min: UP → YES, DOWN → NO
-                if prediction["direction"] == "up":
-                    side = "yes"
-                    trade_price = contract["yes_price"]
-                else:
-                    side = "no"
-                    trade_price = contract["no_price"]
-            else:
-                # Other contracts: buy the cheaper side if prediction aligns
-                buy_yes_below = mp.get("buy_yes_below", 45)
-                buy_no_above = mp.get("buy_no_above", 55)
-                yes_p = contract["yes_price"]
-                if yes_p < buy_yes_below and prediction["direction"] == "up":
-                    side = "yes"
-                    trade_price = yes_p
-                elif yes_p > buy_no_above and prediction["direction"] == "down":
-                    side = "no"
-                    trade_price = contract["no_price"]
-                else:
-                    continue  # Prediction doesn't align with price edge
+            evaluation = evaluate_contract(
+                db=self.db,
+                crypto_prices=self.crypto_prices,
+                ticker=ticker,
+                strike_price=strike,
+                spot_price=spot,
+                yes_price_cents=c['yes_price'],
+                no_price_cents=c['no_price'],
+                expiration_time=exp_time,
+                asset=asset,
+            )
 
-            if not trade_price or trade_price <= 0:
+            if evaluation["recommendation"] == "skip":
                 continue
 
-            confidence = prediction["confidence"]
-
-            if confidence > best_confidence:
-                best_confidence = confidence
+            edge = max(evaluation["edge_yes"], evaluation["edge_no"])
+            if edge > best_edge:
+                best_edge = edge
+                side = "yes" if evaluation["recommendation"] == "buy_yes" else "no"
                 best_trade = {
-                    'contract': contract,
-                    'prediction': prediction,
+                    'contract': c,
+                    'prediction': evaluation,
                     'side': side,
-                    'trade_price': trade_price,
+                    'trade_price': evaluation.get("trade_price", c['yes_price']),
                     'asset': asset,
                 }
 
         if not best_trade:
-            self.logger.info("Value bet: no confident predictions")
+            self.logger.info("Value bet: no mispriced contracts found")
             return None
 
         c = best_trade['contract']
@@ -641,10 +639,13 @@ class Trader:
 
         self._last_value_bet_time = time.time()
 
-        reasons_str = "; ".join(p["reasons"][:3])
-        self.logger.info(f"Value bet: {best_trade['asset']} predicted {p['direction'].upper()} "
-                        f"({p['confidence']:.0%}) — buying {best_trade['side'].upper()} "
-                        f"at {best_trade['trade_price']}¢")
+        reasons_str = "; ".join(p.get("reasons", [])[:3])
+        self.logger.info(f"Value bet: {best_trade['asset']} {c['ticker']} — "
+                        f"P(strike)={p.get('probability', 0):.1%}, "
+                        f"fair={p.get('fair_value_yes', 50):.0f}¢, "
+                        f"market={c['yes_price']}¢, "
+                        f"edge={best_edge:+.0f}¢ — "
+                        f"BUY {best_trade['side'].upper()} at {best_trade['trade_price']}¢")
 
         return {
             'event_id': c['ticker'],
