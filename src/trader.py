@@ -478,14 +478,22 @@ class Trader:
 
     def _value_bet_fallback(self, market_data):
         """
-        Fallback strategy: place minimum-size bets on markets with extreme prices.
+        Fallback strategy: 1 value bet per hour on 15-minute BTC/ETH/SOL contracts only.
 
-        Markets priced near extremes (< 20¢ or > 80¢) reflect strong consensus.
-        We bet WITH the consensus using 1-contract minimum bets to generate
-        outcome data for model training.
+        Focuses on short-term "up or down" markets where we can use spot price
+        momentum to find edge. No monthly or long-dated contracts.
         """
+        import re
+        from db import extract_asset
+
         markets = market_data.get("markets", [])
         if not markets:
+            return None
+
+        # Rate limit: max 1 value bet per hour
+        if not hasattr(self, '_last_value_bet_time'):
+            self._last_value_bet_time = 0
+        if time.time() - self._last_value_bet_time < 3600:
             return None
 
         # Don't stack too many fallback positions
@@ -493,19 +501,14 @@ class Trader:
             1 for p in self.current_positions.values()
             if p.get('strategy') == 'value_bet'
         )
-        mp = self.model_params
-        max_pos = mp.get("max_positions", 3)
-        if fallback_positions >= max_pos:
-            self.logger.info(f"Value bet fallback: already at {max_pos} positions, skipping")
+        if fallback_positions >= 2:
             return None
 
-        # Use learned price range and thresholds
+        mp = self.model_params
         min_price = mp.get("min_entry_price_cents", 20)
         max_price = mp.get("max_entry_price_cents", 80)
         buy_yes_below = mp.get("buy_yes_below", 45)
         buy_no_above = mp.get("buy_no_above", 55)
-        min_edge = mp.get("min_edge", 0.05)
-        asset_weights = mp.get("asset_weights", {})
 
         candidates = []
         for m in markets:
@@ -513,17 +516,19 @@ class Trader:
             if not ticker or ticker in self.current_positions:
                 continue
 
+            # ONLY 15-minute contracts (BTC15M, ETH15M, SOL15M)
+            if '15M' not in ticker.upper():
+                continue
+
             yes_price = _get_market_price_cents(m)
             if not yes_price or yes_price <= 0:
                 continue
 
-            price = yes_price / 100  # Normalize to 0-1
+            price = yes_price / 100
 
-            # Use learned entry range
             if yes_price < min_price or yes_price > max_price:
                 continue
 
-            # Use learned buy/sell thresholds
             if price < (buy_yes_below / 100):
                 direction = 'long'
                 edge = (buy_yes_below / 100) - price
@@ -531,31 +536,18 @@ class Trader:
                 direction = 'short'
                 edge = price - (buy_no_above / 100)
             else:
-                continue  # Inside dead zone — no edge
+                continue
 
-            # Boost edge for contracts whose strike is near current spot price
-            # These have the most uncertainty and best risk/reward
-            from db import extract_asset
+            # Boost for spot price momentum
             asset = extract_asset(ticker)
-            spot = self.crypto_prices.get_price(asset)
-            title = m.get('title', '')
-
+            change_24h = self.crypto_prices.get_change_24h(asset)
             spot_boost = 0
-            if spot and title:
-                # Try to extract strike price from title (e.g. "Bitcoin price range on Apr 1, 2026?")
-                import re
-                strike_match = re.search(r'[\$]?([\d,]+)', title)
-                if strike_match:
-                    try:
-                        strike = float(strike_match.group(1).replace(',', ''))
-                        # How close is the strike to current spot? (as %)
-                        distance_pct = abs(strike - spot) / spot if spot > 0 else 1
-                        if distance_pct < 0.05:  # Within 5% of spot
-                            spot_boost = 0.15
-                        elif distance_pct < 0.10:  # Within 10%
-                            spot_boost = 0.08
-                    except ValueError:
-                        pass
+            if change_24h is not None:
+                # If spot is trending in our direction, boost confidence
+                if direction == 'long' and change_24h > 1.0:
+                    spot_boost = 0.10  # Spot up > 1%, boost YES bet
+                elif direction == 'short' and change_24h < -1.0:
+                    spot_boost = 0.10  # Spot down > 1%, boost NO bet
 
             candidates.append({
                 'market': m,
@@ -563,7 +555,6 @@ class Trader:
                 'price': yes_price,
                 'direction': direction,
                 'edge': edge + spot_boost,
-                'spot_boost': spot_boost,
                 'asset': asset,
             })
 
@@ -579,8 +570,10 @@ class Trader:
         side = 'yes' if best['direction'] == 'long' else 'no'
         trade_price = best['price'] if side == 'yes' else _get_no_price_cents(best['market'])
 
-        self.logger.info(f"Value bet fallback: buy {side.upper()} 1 unit of {best['ticker']} "
-                        f"at {trade_price}¢ (edge: {best['edge']:.2f})")
+        self._last_value_bet_time = time.time()
+
+        self.logger.info(f"Value bet: buy {side.upper()} 1x {best['ticker']} "
+                        f"at {trade_price}¢ (edge: {best['edge']:.2f}, asset: {best['asset']})")
 
         return {
             'event_id': best['ticker'],
@@ -591,7 +584,7 @@ class Trader:
             'strategy': 'value_bet',
             'confidence': 0.5 + best['edge'],
             'title': best['market'].get('title', best['ticker']),
-            'reason': f"Buy {side.upper()} at {trade_price}¢ (YES price: {best['price']}¢, edge: {best['edge']:.0%})",
+            'reason': f"15-min {best['asset']} — Buy {side.upper()} at {trade_price}¢ (edge: {best['edge']:.0%})",
             'expiration_time': best['market'].get('expected_expiration_time') or best['market'].get('expiration_time'),
         }
 
