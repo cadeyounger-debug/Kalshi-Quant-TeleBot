@@ -102,6 +102,12 @@ class Trader:
         self.model_params = load_current_params()
         self.logger.info(f"Loaded model params v{self.model_params.get('version', 0)}")
 
+        # Restore open positions from database (survives restarts/deploys)
+        restored = self.db.load_positions()
+        if restored:
+            self.current_positions = restored
+            self.logger.info(f"Restored {len(restored)} open positions from database")
+
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
         self.market_data_streamer = MarketDataStreamer(
@@ -771,8 +777,8 @@ class Trader:
             )
             self.performance_analytics.record_trade(trade)
 
-            # Store position locally for tracking exits
-            self.current_positions[event_id] = {
+            # Store position locally and persist to database
+            position = {
                 'quantity': quantity,
                 'entry_price': price_cents,
                 'side': side,
@@ -783,6 +789,8 @@ class Trader:
                 'expiration_time': trade_decision.get('expiration_time'),
                 'opened_at': time.time(),
             }
+            self.current_positions[event_id] = position
+            self.db.save_position(event_id, position)
 
             # Send clean trade notification
             title = trade_decision.get('title', event_id)
@@ -923,8 +931,9 @@ class Trader:
                     pnl=pnl_dollars,
                 )
 
-                # Remove position
+                # Remove position from memory and database
                 del self.current_positions[market_id]
+                self.db.delete_position(market_id)
 
                 # Notify
                 pnl_emoji = "🟢" if pnl_dollars >= 0 else "🔴"

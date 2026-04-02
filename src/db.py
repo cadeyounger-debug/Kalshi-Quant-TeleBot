@@ -100,6 +100,20 @@ CREATE TABLE IF NOT EXISTS crypto_prices (
     timestamp       TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS open_positions (
+    market_id       TEXT PRIMARY KEY,
+    asset           TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    quantity        INTEGER NOT NULL,
+    entry_price     REAL NOT NULL,
+    strategy        TEXT,
+    trade_id        TEXT,
+    title           TEXT,
+    expiration_time TEXT,
+    opened_at       REAL,
+    timestamp       TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_asset_ts   ON market_snapshots(asset, timestamp);
 CREATE INDEX IF NOT EXISTS idx_decisions_asset_ts   ON trade_decisions(asset, timestamp);
 CREATE INDEX IF NOT EXISTS idx_decisions_strategy    ON trade_decisions(strategy);
@@ -159,6 +173,22 @@ class TradingDB:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_crypto_prices_asset_ts "
                 "ON crypto_prices(asset, timestamp)"
+            )
+
+            # Migrate: create open_positions table if missing
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS open_positions ("
+                "market_id TEXT PRIMARY KEY, "
+                "asset TEXT NOT NULL, "
+                "side TEXT NOT NULL, "
+                "quantity INTEGER NOT NULL, "
+                "entry_price REAL NOT NULL, "
+                "strategy TEXT, "
+                "trade_id TEXT, "
+                "title TEXT, "
+                "expiration_time TEXT, "
+                "opened_at REAL, "
+                "timestamp TEXT NOT NULL)"
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -401,3 +431,50 @@ class TradingDB:
             with self._connect() as conn:
                 rows = conn.execute(sql, params).fetchall()
                 return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Open positions persistence
+    # ------------------------------------------------------------------
+
+    def save_position(self, market_id: str, position: Dict[str, Any]) -> None:
+        """Save or update an open position."""
+        asset = extract_asset(market_id)
+        timestamp = _now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO open_positions "
+                    "(market_id, asset, side, quantity, entry_price, strategy, "
+                    "trade_id, title, expiration_time, opened_at, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (market_id, asset,
+                     position.get("side", "yes"),
+                     position.get("quantity", 1),
+                     position.get("entry_price", 0),
+                     position.get("strategy", ""),
+                     position.get("trade_id", ""),
+                     position.get("title", market_id),
+                     position.get("expiration_time"),
+                     position.get("opened_at"),
+                     timestamp),
+                )
+
+    def delete_position(self, market_id: str) -> None:
+        """Remove a closed position."""
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM open_positions WHERE market_id = ?", (market_id,))
+
+    def load_positions(self) -> Dict[str, Dict[str, Any]]:
+        """Load all open positions. Returns dict keyed by market_id."""
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute("SELECT * FROM open_positions").fetchall()
+                positions = {}
+                for r in rows:
+                    row = dict(r)
+                    mid = row.pop("market_id")
+                    row.pop("asset", None)
+                    row.pop("timestamp", None)
+                    positions[mid] = row
+                return positions
