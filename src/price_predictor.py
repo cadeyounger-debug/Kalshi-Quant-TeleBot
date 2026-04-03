@@ -222,8 +222,12 @@ def evaluate_contract(
         "volatility": round(vol, 3),
     })
 
-    # Minimum edge to trade (in cents)
-    min_edge = 3  # Need at least 3¢ edge
+    # Minimum edge depends on contract type
+    # Must account for 2¢ fee per trade (entry + exit = 4¢ round trip)
+    # 15-min contracts need bigger edge — thin edge = coin flip
+    is_short_term = hours_left < 1
+    FEE_CENTS = 4  # 2¢ entry + 2¢ exit
+    min_edge = 15 + FEE_CENTS if is_short_term else 5 + FEE_CENTS  # 19¢ for 15-min, 9¢ for monthly
 
     distance_pct = abs(spot_price - strike_price) / spot_price * 100
     result["distance_pct"] = round(distance_pct, 2)
@@ -231,19 +235,32 @@ def evaluate_contract(
     result["reasons"].append(f"Time: {hours_left:.1f}h, Vol: {vol:.0%}")
     result["reasons"].append(f"P({direction} strike): {prob:.1%}, Fair YES: {fair_yes:.0f}¢, Market: {yes_price_cents:.0f}¢")
 
+    # Don't trade 15-min contracts when spot is basically at the strike (< 0.05%)
+    # This is a coin flip with no real edge
+    if is_short_term and distance_pct < 0.05:
+        result["recommendation"] = "skip"
+        result["reasons"].append(f"Spot too close to strike ({distance_pct:.2f}%) — coin flip, skipping")
+        return result
+
+    # Don't trade 15-min when probability is between 40-60% (no conviction)
+    if is_short_term and 0.40 < prob < 0.60:
+        result["recommendation"] = "skip"
+        result["reasons"].append(f"Probability {prob:.0%} too close to 50/50 — no conviction")
+        return result
+
     if edge_yes >= min_edge and yes_price_cents > 0:
         result["recommendation"] = "buy_yes"
-        result["confidence"] = min(edge_yes / 10, 1.0)  # 10¢ edge = 100% confidence
+        result["confidence"] = min(edge_yes / 20, 1.0)  # 20¢ edge = 100% confidence
         result["trade_price"] = yes_price_cents
         result["reasons"].append(f"YES undervalued by {edge_yes:.0f}¢ — BUY YES")
     elif edge_no >= min_edge and no_price_cents > 0:
         result["recommendation"] = "buy_no"
-        result["confidence"] = min(edge_no / 10, 1.0)
+        result["confidence"] = min(edge_no / 20, 1.0)
         result["trade_price"] = no_price_cents
         result["reasons"].append(f"NO undervalued by {edge_no:.0f}¢ — BUY NO")
     else:
         result["recommendation"] = "skip"
-        result["reasons"].append(f"No edge (YES edge: {edge_yes:+.0f}¢, NO edge: {edge_no:+.0f}¢)")
+        result["reasons"].append(f"Edge too thin (YES: {edge_yes:+.0f}¢, NO: {edge_no:+.0f}¢, need {min_edge}¢)")
 
     return result
 
