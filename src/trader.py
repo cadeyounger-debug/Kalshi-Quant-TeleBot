@@ -713,10 +713,20 @@ class Trader:
                 asset=asset,
             )
 
+            edge_yes = evaluation.get("edge_yes", 0)
+            edge_no = evaluation.get("edge_no", 0)
+            best_edge_here = max(edge_yes, edge_no)
+
+            if '15M' in ticker.upper():
+                self.logger.info(f"    → P={evaluation.get('probability', 0):.0%}, "
+                               f"fair_yes={evaluation.get('fair_value_yes', 0):.0f}¢, "
+                               f"edge_yes={edge_yes:+.0f}¢, edge_no={edge_no:+.0f}¢, "
+                               f"rec={evaluation['recommendation']}")
+
             if evaluation["recommendation"] == "skip":
                 continue
 
-            edge = max(evaluation["edge_yes"], evaluation["edge_no"])
+            edge = best_edge_here
 
             # Boost edge based on window timing
             if is_15m:
