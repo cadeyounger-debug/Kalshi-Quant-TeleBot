@@ -924,6 +924,32 @@ class Trader:
                 self.logger.error(f"Order failed for {event_id}")
                 return
 
+            # Place a resting limit sell as a hard stop loss on the exchange.
+            # This fires instantly via Kalshi's matching engine instead of
+            # waiting for our 60s polling loop. The momentum-based exits
+            # handle smart exits; this is the emergency parachute.
+            stop_price = max(1, int(price_cents * 0.70))  # Hard floor at 30% loss
+            stop_payload = {
+                'ticker': event_id,
+                'action': 'sell',
+                'side': side,
+                'count': quantity,
+                'type': 'limit',
+            }
+            if side == 'yes':
+                stop_payload['yes_price'] = stop_price
+            else:
+                stop_payload['no_price'] = stop_price
+
+            stop_result = self.api.create_order(stop_payload)
+            stop_order_id = None
+            if stop_result:
+                stop_order_id = stop_result.get('order', {}).get('order_id')
+                self.logger.info(f"STOP LOSS placed: sell {side} @ {stop_price}¢ "
+                                 f"(order_id={stop_order_id})")
+            else:
+                self.logger.warning(f"Failed to place stop loss for {event_id}")
+
             # Record trade in performance analytics
             trade = Trade(
                 trade_id=trade_id,
@@ -949,6 +975,7 @@ class Trader:
                 'opened_at': time.time(),
                 'strike_price': trade_decision.get('strike_price'),
                 'entry_spot': trade_decision.get('spot_price'),
+                'stop_order_id': stop_order_id,
             }
             self.current_positions[event_id] = position
             self.db.save_position(event_id, position)
@@ -1126,6 +1153,16 @@ class Trader:
         entry = position['entry_price']
         side = position['side']
         title = position.get('title', market_id)
+
+        # Cancel the resting stop loss order before closing — otherwise we'd double-sell
+        stop_order_id = position.get('stop_order_id')
+        if stop_order_id:
+            try:
+                self.api.cancel_order(stop_order_id)
+                self.logger.info(f"Cancelled stop loss order {stop_order_id}")
+            except Exception as e:
+                # May already be filled or expired — that's fine
+                self.logger.info(f"Stop loss cancel skipped ({e})")
 
         # Get actual sell price for our side (use bid — that's what we can sell at)
         if side == 'yes':
