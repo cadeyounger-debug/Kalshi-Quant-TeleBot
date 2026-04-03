@@ -636,6 +636,8 @@ class Trader:
         best_trade = None
         best_edge = 0
 
+        self.logger.info(f"Value bet evaluating: {len(contracts_15m)} 15-min, {len(contracts_daily)} other contracts")
+
         for c in contracts:
             ticker = c['ticker']
             asset = c['asset']
@@ -648,6 +650,8 @@ class Trader:
                 target_match = re.search(r'[\$]([\d,]+\.?\d*)', sub_title)
                 if target_match:
                     strike = float(target_match.group(1).replace(',', ''))
+                if '15M' in ticker.upper():
+                    self.logger.info(f"  15M contract {ticker}: sub='{sub_title}', parsed strike={strike}")
 
             if strike <= 0:
                 continue
