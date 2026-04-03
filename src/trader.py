@@ -947,6 +947,8 @@ class Trader:
                 'title': trade_decision.get('title', event_id),
                 'expiration_time': trade_decision.get('expiration_time'),
                 'opened_at': time.time(),
+                'strike_price': trade_decision.get('strike_price'),
+                'entry_spot': trade_decision.get('spot_price'),
             }
             self.current_positions[event_id] = position
             self.db.save_position(event_id, position)
@@ -968,16 +970,20 @@ class Trader:
             self.notifier.send_error_notification(f"Trade execution error for {event_id}: {e}")
 
     def check_exits(self, markets: List[Dict[str, Any]]):
-        """Check all open positions for exits.
+        """Check all open positions for exits using spot price momentum.
+
+        For 15M binary contracts, contract price is just a derivative of
+        spot vs strike. Watching contract price for stops is meaningless —
+        it can swing 50% in a minute. Instead, watch the underlying:
 
         Exit priority:
-        1. Hard stop loss — kill losers fast (10% drop from entry)
-        2. Breakeven stop — once up 15%, move stop to entry price
-        3. Trailing stop — once up 25%, trail 20% behind high-water mark
+        1. Spot momentum stop — spot moving against our bet with strong trend
+        2. Spot distance stop — spot crossed strike and is pulling away
+        3. Trailing stop on contract price — for non-15M positions
         4. Time exit — close 2 min before expiry
-        (No fixed take-profit ceiling — let winners ride via trailing stop)
         """
         from datetime import datetime, timezone
+        from price_predictor import compute_momentum
 
         if not self.current_positions:
             return
@@ -989,16 +995,20 @@ class Trader:
             if ticker:
                 market_lookup[ticker] = m
 
+        # Get current spot prices
+        spot_prices = getattr(self, '_current_spot_prices', {})
+
         positions_to_close = []
 
         for market_id, position in self.current_positions.items():
-            entry = position['entry_price']  # Price we paid (YES or NO cents)
+            entry = position['entry_price']
+            side = position['side']
             m = market_lookup.get(market_id)
             if not m:
                 continue
 
-            # Get actual current price for the side we hold
-            if position['side'] == 'yes':
+            # Get current contract price for our side
+            if side == 'yes':
                 current_side_price = _get_market_price_cents(m)
             else:
                 current_side_price = _get_no_price_cents(m)
@@ -1006,40 +1016,78 @@ class Trader:
             if not current_side_price:
                 continue
 
-            # Track high-water mark for trailing stop
-            if 'high_water' not in position or current_side_price > position['high_water']:
-                position['high_water'] = current_side_price
-
-            high_water = position['high_water']
-
             reason = None
-            sl_pct = self.model_params.get("stop_loss_pct", 0.10)          # Kill losers at 10%
-            breakeven_trigger = self.model_params.get("breakeven_trigger", 0.15)  # Move stop to entry at +15%
-            trail_trigger = self.model_params.get("trail_trigger", 0.25)    # Start trailing at +25%
-            trail_pct = self.model_params.get("trail_pct", 0.20)            # Trail 20% behind peak
             time_exit_secs = self.model_params.get("time_exit_seconds", 120)
+            is_15m = '15M' in market_id.upper()
 
-            gain_pct = (current_side_price - entry) / entry if entry > 0 else 0
-            peak_gain_pct = (high_water - entry) / entry if entry > 0 else 0
-            drop_from_peak_pct = (high_water - current_side_price) / high_water if high_water > 0 else 0
+            # --- 15M contracts: use spot price + momentum for exits ---
+            if is_15m:
+                asset = extract_asset(market_id)
+                strike = position.get('strike_price') or _parse_strike_from_ticker(market_id)
+                spot = None
+                if spot_prices and asset in spot_prices:
+                    spot = spot_prices[asset].get("price")
 
-            # --- Exit logic (priority order) ---
+                if spot and strike and strike > 0:
+                    # How far is spot from strike (as % of strike)?
+                    spot_distance_pct = (spot - strike) / strike
 
-            # 1. Hard stop loss: kill losers fast
-            if gain_pct <= -sl_pct:
-                reason = f"Stop loss ({gain_pct:+.0%} from entry)"
+                    # Get momentum: is spot trending toward or away from our bet?
+                    momentum = compute_momentum(self.db, asset, strike)
+                    mom_direction = momentum.get("direction", 0)
+                    mom_r2 = momentum.get("r_squared", 0)
+                    mom_speed = abs(momentum.get("speed_pct_per_min", 0))
 
-            # 2. Trailing stop: once we've been up 25%+, trail 20% behind the peak
-            if not reason and peak_gain_pct >= trail_trigger:
-                if drop_from_peak_pct >= trail_pct:
-                    reason = f"Trailing stop (peak {high_water}¢, dropped {drop_from_peak_pct:.0%} from peak)"
+                    # Our bet direction: YES = we want spot above strike
+                    #                    NO  = we want spot below strike
+                    want_above = (side == 'yes')
 
-            # 3. Breakeven stop: once we've been up 15%, don't let it become a loss
-            if not reason and peak_gain_pct >= breakeven_trigger:
-                if current_side_price <= entry:
+                    # Is spot on the wrong side of strike?
+                    spot_wrong_side = (want_above and spot < strike) or (not want_above and spot > strike)
+
+                    # Is momentum moving against us?
+                    # mom_direction: +1 = price rising, -1 = price falling
+                    momentum_against = (want_above and mom_direction < 0) or (not want_above and mom_direction > 0)
+
+                    # 1. Spot crossed strike AND momentum is against us — get out
+                    if spot_wrong_side and momentum_against and mom_r2 > 0.3:
+                        reason = (f"Spot momentum exit: spot ${spot:,.0f} {'below' if want_above else 'above'} "
+                                  f"strike ${strike:,.0f} ({spot_distance_pct:+.2%}), "
+                                  f"trending against (R²={mom_r2:.2f})")
+
+                    # 2. Spot far on wrong side (>0.3%) — exit regardless of momentum
+                    if not reason and spot_wrong_side and abs(spot_distance_pct) > 0.003:
+                        reason = (f"Spot distance exit: spot ${spot:,.0f} is {abs(spot_distance_pct):.2%} "
+                                  f"{'below' if want_above else 'above'} strike ${strike:,.0f}")
+
+                    # 3. Spot on right side but momentum strongly reversing against us
+                    if not reason and not spot_wrong_side and momentum_against and mom_r2 > 0.5 and mom_speed > 0.01:
+                        reason = (f"Momentum reversal: spot still {'above' if want_above else 'below'} strike "
+                                  f"but trending hard against (R²={mom_r2:.2f}, speed={mom_speed:.3f}%/min)")
+
+            # --- Non-15M contracts: use contract price trailing stop ---
+            if not reason and not is_15m:
+                # Track high-water mark
+                if 'high_water' not in position or current_side_price > position['high_water']:
+                    position['high_water'] = current_side_price
+                high_water = position['high_water']
+
+                trail_trigger = self.model_params.get("trail_trigger", 0.25)
+                trail_pct = self.model_params.get("trail_pct", 0.20)
+                breakeven_trigger = self.model_params.get("breakeven_trigger", 0.15)
+
+                gain_pct = (current_side_price - entry) / entry if entry > 0 else 0
+                peak_gain_pct = (high_water - entry) / entry if entry > 0 else 0
+                drop_from_peak = (high_water - current_side_price) / high_water if high_water > 0 else 0
+
+                if peak_gain_pct >= trail_trigger and drop_from_peak >= trail_pct:
+                    reason = f"Trailing stop (peak {high_water}¢, dropped {drop_from_peak:.0%})"
+                elif peak_gain_pct >= breakeven_trigger and current_side_price <= entry:
                     reason = f"Breakeven stop (was +{peak_gain_pct:.0%}, now back to entry)"
+                elif gain_pct <= -self.model_params.get("stop_loss_pct", 0.10):
+                    reason = f"Stop loss ({gain_pct:+.0%} from entry)"
 
-            # 4. Time exit: close before expiration
+            # --- Time exit: close before expiration (all contract types) ---
             if not reason and position.get('expiration_time'):
                 try:
                     exp_str = position['expiration_time']
