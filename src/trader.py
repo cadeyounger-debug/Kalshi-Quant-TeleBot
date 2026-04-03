@@ -121,8 +121,32 @@ class Trader:
         # Restore open positions from database (survives restarts/deploys)
         restored = self.db.load_positions()
         if restored:
-            self.current_positions = restored
-            self.logger.info(f"Restored {len(restored)} open positions from database")
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            kept = {}
+            for mid, pos in restored.items():
+                # Log each position for visibility
+                self.logger.info(f"  Restored: {mid} | {pos.get('side')} x{pos.get('quantity')} "
+                                 f"@ {pos.get('entry_price')}¢ | {pos.get('strategy')}")
+
+                # Drop expired positions — they've already settled
+                exp_str = pos.get('expiration_time')
+                if exp_str:
+                    try:
+                        if exp_str.endswith('Z'):
+                            exp_str = exp_str[:-1] + '+00:00'
+                        exp_dt = datetime.fromisoformat(exp_str)
+                        if now > exp_dt:
+                            self.logger.info(f"  → Dropping expired position: {mid}")
+                            self.db.delete_position(mid)
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                kept[mid] = pos
+
+            self.current_positions = kept
+            self.logger.info(f"Restored {len(kept)} open positions ({len(restored) - len(kept)} expired/dropped)")
 
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
