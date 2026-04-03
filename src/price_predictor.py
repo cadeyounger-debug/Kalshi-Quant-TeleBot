@@ -329,12 +329,10 @@ def evaluate_contract(
         "volatility": round(vol, 3),
     })
 
-    # Minimum edge depends on contract type
-    # Must account for 2¢ fee per trade (entry + exit = 4¢ round trip)
-    # 15-min contracts need bigger edge — thin edge = coin flip
+    # Minimum edge: 7¢ for 15-min, 9¢ for longer contracts
+    # Accounts for 4¢ round-trip fees (2¢ entry + 2¢ exit)
     is_short_term = hours_left < 1
-    FEE_CENTS = 4  # 2¢ entry + 2¢ exit
-    min_edge = 10 + FEE_CENTS if is_short_term else 5 + FEE_CENTS  # 14¢ for 15-min, 9¢ for monthly
+    min_edge = 7 if is_short_term else 9
 
     distance_pct = abs(spot_price - strike_price) / spot_price * 100
     result["distance_pct"] = round(distance_pct, 2)
@@ -351,8 +349,8 @@ def evaluate_contract(
         result["reasons"].append(f"Spot too close to strike ({distance_pct:.2f}%) — coin flip, skipping")
         return result
 
-    # Don't trade 15-min when probability is between 40-60% (no conviction)
-    if is_short_term and 0.40 < prob < 0.60:
+    # Don't trade 15-min when probability is between 45-55% (no conviction)
+    if is_short_term and 0.45 < prob < 0.55:
         result["recommendation"] = "skip"
         result["reasons"].append(f"Probability {prob:.0%} too close to 50/50 — no conviction")
         return result
