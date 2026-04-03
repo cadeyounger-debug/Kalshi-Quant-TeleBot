@@ -792,6 +792,11 @@ class Trader:
             'title': c['market'].get('title', c['ticker']),
             'reason': f"{'15-min' if is_15m else 'Monthly'} {best_trade['asset']} — {p.get('recommendation', 'buy').upper()} (P={p.get('probability', 0):.0%}, edge={best_edge:+.0f}¢): {reasons_str}",
             'expiration_time': c['market'].get('expected_expiration_time') or c['market'].get('expiration_time'),
+            'edge_cents': round(best_edge, 1),
+            'predicted_probability': p.get('probability', 0),
+            'fair_value': p.get('fair_value_yes' if best_trade['side'] == 'yes' else 'fair_value_no', 50),
+            'spot_price': spot,
+            'strike_price': strike,
         }
 
     def _pick_best_market(self, markets, direction):
@@ -871,6 +876,11 @@ class Trader:
                     price=price_cents,
                     strategy=strategy,
                     order_result=str(result),
+                    edge_cents=trade_decision.get('edge_cents'),
+                    predicted_prob=trade_decision.get('predicted_probability'),
+                    fair_value=trade_decision.get('fair_value'),
+                    spot_price=trade_decision.get('spot_price'),
+                    strike_price=trade_decision.get('strike_price'),
                 )
             else:
                 self.logger.error(f"Order failed for {event_id}")

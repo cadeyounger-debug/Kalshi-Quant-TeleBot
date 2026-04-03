@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS trades (
     strategy        TEXT,
     order_result    TEXT,
     pnl             REAL,
+    edge_cents      REAL,
+    predicted_prob  REAL,
+    fair_value      REAL,
+    spot_price      REAL,
+    strike_price    REAL,
     timestamp       TEXT NOT NULL
 );
 
@@ -175,6 +180,15 @@ class TradingDB:
                 "ON crypto_prices(asset, timestamp)"
             )
 
+            # Migrate: add edge/prediction columns to trades
+            for col in ("edge_cents REAL", "predicted_prob REAL", "fair_value REAL",
+                         "spot_price REAL", "strike_price REAL"):
+                col_name = col.split()[0]
+                try:
+                    conn.execute(f"SELECT {col_name} FROM trades LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
+
             # Migrate: create open_positions table if missing
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS open_positions ("
@@ -264,6 +278,11 @@ class TradingDB:
         strategy: str = None,
         order_result: str = None,
         pnl: float = None,
+        edge_cents: float = None,
+        predicted_prob: float = None,
+        fair_value: float = None,
+        spot_price: float = None,
+        strike_price: float = None,
         asset: str = None,
         timestamp: str = None,
     ) -> int:
@@ -273,10 +292,12 @@ class TradingDB:
             with self._connect() as conn:
                 cur = conn.execute(
                     "INSERT INTO trades "
-                    "(asset, market_ticker, side, quantity, price, strategy, order_result, pnl, timestamp) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(asset, market_ticker, side, quantity, price, strategy, order_result, pnl, "
+                    "edge_cents, predicted_prob, fair_value, spot_price, strike_price, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (asset, market_ticker, side, quantity, price, strategy,
-                     order_result, pnl, timestamp),
+                     order_result, pnl, edge_cents, predicted_prob, fair_value,
+                     spot_price, strike_price, timestamp),
                 )
                 return cur.lastrowid
 

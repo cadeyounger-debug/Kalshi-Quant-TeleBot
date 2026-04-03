@@ -423,11 +423,16 @@ def analyze_trades() -> Dict[str, Any]:
         "losing_entry_prices": [],
     }
 
+    # Edge accuracy tracking
+    edge_predictions = []  # (predicted_edge, actual_pnl, predicted_prob)
+
     for t in trades:
         strategy = t.get("strategy", "unknown")
         asset = t.get("asset", "UNKNOWN")
         pnl = t.get("pnl")
         price = t.get("price", 0)
+        edge = t.get("edge_cents")
+        prob = t.get("predicted_prob")
 
         results["by_strategy"][strategy]["count"] += 1
         results["by_asset"][asset]["count"] += 1
@@ -443,6 +448,38 @@ def analyze_trades() -> Dict[str, Any]:
                 results["by_strategy"][strategy]["losses"] += 1
                 results["by_asset"][asset]["losses"] += 1
                 results["losing_entry_prices"].append(price)
+
+        # Track edge prediction accuracy
+        if edge is not None and pnl is not None:
+            won = pnl > 0
+            edge_predictions.append({
+                "edge": edge, "pnl": pnl, "prob": prob,
+                "won": won, "strategy": strategy, "asset": asset,
+            })
+
+    # Analyze edge accuracy
+    if edge_predictions:
+        total_predicted = len(edge_predictions)
+        correct = sum(1 for e in edge_predictions if e["won"])
+        accuracy = correct / total_predicted if total_predicted > 0 else 0
+
+        # Does higher edge = higher win rate?
+        high_edge = [e for e in edge_predictions if e["edge"] and e["edge"] > 20]
+        low_edge = [e for e in edge_predictions if e["edge"] and e["edge"] <= 20]
+        high_wr = sum(1 for e in high_edge if e["won"]) / len(high_edge) if high_edge else 0
+        low_wr = sum(1 for e in low_edge if e["won"]) / len(low_edge) if low_edge else 0
+
+        results["edge_accuracy"] = {
+            "total_with_edge": total_predicted,
+            "overall_win_rate": round(accuracy, 3),
+            "high_edge_win_rate": round(high_wr, 3),
+            "low_edge_win_rate": round(low_wr, 3),
+            "avg_edge_winners": round(np.mean([e["edge"] for e in edge_predictions if e["won"]]), 1) if any(e["won"] for e in edge_predictions) else 0,
+            "avg_edge_losers": round(np.mean([e["edge"] for e in edge_predictions if not e["won"]]), 1) if any(not e["won"] for e in edge_predictions) else 0,
+        }
+        logger.info(f"Edge accuracy: {accuracy:.0%} win rate ({correct}/{total_predicted})")
+        logger.info(f"  High edge (>20¢): {high_wr:.0%} | Low edge (≤20¢): {low_wr:.0%}")
+        logger.info(f"  Avg edge on winners: {results['edge_accuracy']['avg_edge_winners']}¢ | losers: {results['edge_accuracy']['avg_edge_losers']}¢")
 
     return results
 
