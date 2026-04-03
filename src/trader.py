@@ -151,7 +151,7 @@ class Trader:
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
         self.market_data_streamer = MarketDataStreamer(
-            api, update_interval=60, event_tickers=crypto_events  # Every 1 min for 15-min markets
+            api, update_interval=20, event_tickers=crypto_events  # Every 20s to catch dislocations
         )
         self.performance_analytics = PerformanceAnalytics()
 
