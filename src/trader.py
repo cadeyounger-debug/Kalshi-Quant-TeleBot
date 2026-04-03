@@ -572,12 +572,17 @@ class Trader:
         if time.time() - self._last_value_bet_time < 300:
             return None
 
-        # Don't stack positions
-        fallback_positions = sum(
-            1 for p in self.current_positions.values()
-            if p.get('strategy') == 'value_bet'
+        # Count positions separately — monthly and 15-min have different limits
+        monthly_positions = sum(
+            1 for ticker, p in self.current_positions.items()
+            if p.get('strategy') == 'value_bet' and '15M' not in ticker.upper()
         )
-        if fallback_positions >= 3:
+        short_positions = sum(
+            1 for ticker, p in self.current_positions.items()
+            if p.get('strategy') == 'value_bet' and '15M' in ticker.upper()
+        )
+        # Max 3 monthly + 3 active 15-min positions
+        if monthly_positions >= 3 and short_positions >= 3:
             return None
 
         # Find tradeable contracts — prefer 15-min, allow monthly
@@ -625,12 +630,15 @@ class Trader:
             else:
                 contracts_daily.append(entry)
 
-        # Prefer 15-min, fall back to other same-day contracts
-        contracts = contracts_15m if contracts_15m else contracts_daily
-        if not contracts:
+        # Prefer 15-min, fall back to monthly (only if we have room)
+        if contracts_15m and short_positions < 3:
+            contracts = contracts_15m
+        elif contracts_daily and monthly_positions < 3:
+            contracts = contracts_daily
+        else:
             return None
 
-        is_15m = bool(contracts_15m)
+        is_15m = bool(contracts_15m) and contracts == contracts_15m
 
         # Evaluate each contract — aware of opening vs closing window
         best_trade = None
