@@ -649,12 +649,16 @@ class Trader:
             if yes_price < min_price or yes_price > max_price:
                 continue
             asset = extract_asset(ticker)
+            volume = int(float(m.get('volume', 0) or m.get('volume_24h_fp', 0) or 0))
+            open_interest = int(float(m.get('open_interest', 0) or 0))
             entry = {
                 'market': m,
                 'ticker': ticker,
                 'yes_price': yes_price,
                 'no_price': no_price,
                 'asset': asset,
+                'volume': volume,
+                'open_interest': open_interest,
             }
             if '15M' in ticker.upper():
                 contracts_15m.append(entry)
@@ -742,14 +746,20 @@ class Trader:
                 momentum_weight=self.model_params.get("momentum_weight", 1.0),
             )
 
+            vol_str = f"vol={c['volume']}, OI={c['open_interest']}"
             mom = evaluation.get("momentum", {})
             mom_str = f"mom={evaluation.get('momentum_adj', 0):+.1%}" if mom.get("has_data") else "mom=N/A"
             self.logger.info(
                 f"    → P={evaluation['probability']:.0%} (base={evaluation.get('base_probability', 0):.0%}, {mom_str}), "
                 f"fair_yes={evaluation['fair_value_yes']:.0f}¢, "
                 f"edge_yes={evaluation['edge_yes']:+.0f}¢, edge_no={evaluation['edge_no']:+.0f}¢, "
-                f"rec={evaluation['recommendation']}"
+                f"{vol_str}, rec={evaluation['recommendation']}"
             )
+
+            # Skip low-volume contracts — stale prices and bad fills
+            if c['volume'] == 0 and c['open_interest'] == 0:
+                self.logger.info(f"    → Skipping: no volume or open interest")
+                continue
 
             edge_yes = evaluation.get("edge_yes", 0)
             edge_no = evaluation.get("edge_no", 0)
@@ -765,6 +775,15 @@ class Trader:
                 continue
 
             edge = best_edge_here
+
+            # Volume-based edge scaling:
+            # Low volume (< 10) = possible mispricing, slight boost
+            # High volume (> 100) = market is confident, need bigger edge to disagree
+            contract_volume = c['volume'] + c['open_interest']
+            if contract_volume > 100:
+                edge *= 0.8  # Market is well-traded, harder to find real edge
+            elif contract_volume < 10:
+                edge *= 1.2  # Thin market, mispricing more likely
 
             # Boost edge based on window timing
             if is_15m:
