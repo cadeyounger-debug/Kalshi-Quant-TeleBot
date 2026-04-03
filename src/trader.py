@@ -756,8 +756,9 @@ class Trader:
                 f"{vol_str}, rec={evaluation['recommendation']}"
             )
 
-            # Skip low-volume contracts — stale prices and bad fills
-            if c['volume'] == 0 and c['open_interest'] == 0:
+            # Skip low-volume non-15M contracts — stale prices and bad fills
+            # 15M contracts always start at 0 volume (new every 15 min), so skip this check
+            if c['volume'] == 0 and c['open_interest'] == 0 and '15M' not in c['ticker'].upper():
                 self.logger.info(f"    → Skipping: no volume or open interest")
                 continue
 
