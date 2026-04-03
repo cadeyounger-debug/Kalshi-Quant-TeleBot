@@ -643,15 +643,25 @@ class Trader:
             asset = c['asset']
             strike = _parse_strike_from_ticker(ticker)
 
-            # For 15-min contracts, parse target from yes_sub_title
-            # e.g. "Target Price: $67,027.71"
+            # For 15-min contracts, get target from floor_strike or yes_sub_title
             if strike <= 0:
-                sub_title = c['market'].get('yes_sub_title', '')
-                target_match = re.search(r'[\$]([\d,]+\.?\d*)', sub_title)
-                if target_match:
-                    strike = float(target_match.group(1).replace(',', ''))
+                # floor_strike has the target as a number (e.g. 66521.68)
+                floor_strike = c['market'].get('floor_strike')
+                if floor_strike:
+                    try:
+                        strike = float(floor_strike)
+                    except (ValueError, TypeError):
+                        pass
+
+                # Fallback: parse from yes_sub_title (populated after finalization)
+                if strike <= 0:
+                    sub_title = c['market'].get('yes_sub_title', '')
+                    target_match = re.search(r'[\$]([\d,]+\.?\d*)', sub_title)
+                    if target_match:
+                        strike = float(target_match.group(1).replace(',', ''))
+
                 if '15M' in ticker.upper():
-                    self.logger.info(f"  15M contract {ticker}: sub='{sub_title}', parsed strike={strike}")
+                    self.logger.info(f"  15M {ticker}: strike={strike}, yes={c['yes_price']}¢, no={c['no_price']}¢")
 
             if strike <= 0:
                 continue
