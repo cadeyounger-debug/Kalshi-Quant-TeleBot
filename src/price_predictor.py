@@ -329,10 +329,9 @@ def evaluate_contract(
         "volatility": round(vol, 3),
     })
 
-    # Minimum edge: 7¢ for 15-min, 9¢ for longer contracts
-    # Accounts for 4¢ round-trip fees (2¢ entry + 2¢ exit)
+    # Minimum edge: 5¢ for 15-min (4¢ fees + 1¢ profit), 9¢ for longer
     is_short_term = hours_left < 1
-    min_edge = 7 if is_short_term else 9
+    min_edge = 5 if is_short_term else 9
 
     distance_pct = abs(spot_price - strike_price) / spot_price * 100
     result["distance_pct"] = round(distance_pct, 2)
