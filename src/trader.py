@@ -345,7 +345,7 @@ class Trader:
             except Exception as e:
                 self.logger.error(f"Error in value bet fallback: {e}")
 
-        # Record decision to db
+        # Record decision to db (all strategies, for data collection)
         if trade_decision:
             self.db.record_trade_decision(
                 trade_decision.get("event_id", ""),
@@ -355,6 +355,13 @@ class Trader:
                 sentiment_score=trade_decision.get("sentiment_score"),
                 should_trade=True,
             )
+
+        # Only execute trades on 15-minute contracts — collect data on everything else
+        if trade_decision:
+            ticker = trade_decision.get('event_id', '')
+            if '15M' not in ticker.upper():
+                self.logger.info(f"Skipping non-15M trade (data only): {ticker}")
+                return None
 
         return trade_decision
 
@@ -630,15 +637,12 @@ class Trader:
             else:
                 contracts_daily.append(entry)
 
-        # Prefer 15-min, fall back to monthly (only if we have room)
-        if contracts_15m and short_positions < 3:
-            contracts = contracts_15m
-        elif contracts_daily and monthly_positions < 3:
-            contracts = contracts_daily
-        else:
+        # Only trade 15-minute contracts (still collecting data on others above)
+        contracts = contracts_15m
+        if not contracts:
             return None
 
-        is_15m = bool(contracts_15m) and contracts == contracts_15m
+        is_15m = True
 
         # Evaluate each contract — aware of opening vs closing window
         best_trade = None
@@ -711,6 +715,16 @@ class Trader:
                 no_price_cents=c['no_price'],
                 expiration_time=exp_time,
                 asset=asset,
+                momentum_weight=self.model_params.get("momentum_weight", 1.0),
+            )
+
+            mom = evaluation.get("momentum", {})
+            mom_str = f"mom={evaluation.get('momentum_adj', 0):+.1%}" if mom.get("has_data") else "mom=N/A"
+            self.logger.info(
+                f"    → P={evaluation['probability']:.0%} (base={evaluation.get('base_probability', 0):.0%}, {mom_str}), "
+                f"fair_yes={evaluation['fair_value_yes']:.0f}¢, "
+                f"edge_yes={evaluation['edge_yes']:+.0f}¢, edge_no={evaluation['edge_no']:+.0f}¢, "
+                f"rec={evaluation['recommendation']}"
             )
 
             edge_yes = evaluation.get("edge_yes", 0)
@@ -930,7 +944,15 @@ class Trader:
             self.notifier.send_error_notification(f"Trade execution error for {event_id}: {e}")
 
     def check_exits(self, markets: List[Dict[str, Any]]):
-        """Check all open positions for take-profit, stop-loss, and time-based exits."""
+        """Check all open positions for exits.
+
+        Exit priority:
+        1. Hard stop loss — kill losers fast (10% drop from entry)
+        2. Breakeven stop — once up 15%, move stop to entry price
+        3. Trailing stop — once up 25%, trail 20% behind high-water mark
+        4. Time exit — close 2 min before expiry
+        (No fixed take-profit ceiling — let winners ride via trailing stop)
+        """
         from datetime import datetime, timezone
 
         if not self.current_positions:
@@ -960,23 +982,40 @@ class Trader:
             if not current_side_price:
                 continue
 
+            # Track high-water mark for trailing stop
+            if 'high_water' not in position or current_side_price > position['high_water']:
+                position['high_water'] = current_side_price
+
+            high_water = position['high_water']
+
             reason = None
-            tp_pct = self.model_params.get("take_profit_pct", 0.50)
-            sl_pct = self.model_params.get("stop_loss_pct", 0.30)
+            sl_pct = self.model_params.get("stop_loss_pct", 0.10)          # Kill losers at 10%
+            breakeven_trigger = self.model_params.get("breakeven_trigger", 0.15)  # Move stop to entry at +15%
+            trail_trigger = self.model_params.get("trail_trigger", 0.25)    # Start trailing at +25%
+            trail_pct = self.model_params.get("trail_pct", 0.20)            # Trail 20% behind peak
             time_exit_secs = self.model_params.get("time_exit_seconds", 120)
 
-            # Take profit: our side's price went up
             gain_pct = (current_side_price - entry) / entry if entry > 0 else 0
-            if gain_pct >= tp_pct:
-                reason = f"Take profit (+{gain_pct:.0%})"
+            peak_gain_pct = (high_water - entry) / entry if entry > 0 else 0
+            drop_from_peak_pct = (high_water - current_side_price) / high_water if high_water > 0 else 0
 
-            # Stop loss: our side's price went down
-            if not reason:
-                loss_pct = (entry - current_side_price) / entry if entry > 0 else 0
-                if loss_pct >= sl_pct:
-                    reason = f"Stop loss (-{loss_pct:.0%})"
+            # --- Exit logic (priority order) ---
 
-            # Time exit: close before expiration
+            # 1. Hard stop loss: kill losers fast
+            if gain_pct <= -sl_pct:
+                reason = f"Stop loss ({gain_pct:+.0%} from entry)"
+
+            # 2. Trailing stop: once we've been up 25%+, trail 20% behind the peak
+            if not reason and peak_gain_pct >= trail_trigger:
+                if drop_from_peak_pct >= trail_pct:
+                    reason = f"Trailing stop (peak {high_water}¢, dropped {drop_from_peak_pct:.0%} from peak)"
+
+            # 3. Breakeven stop: once we've been up 15%, don't let it become a loss
+            if not reason and peak_gain_pct >= breakeven_trigger:
+                if current_side_price <= entry:
+                    reason = f"Breakeven stop (was +{peak_gain_pct:.0%}, now back to entry)"
+
+            # 4. Time exit: close before expiration
             if not reason and position.get('expiration_time'):
                 try:
                     exp_str = position['expiration_time']
@@ -1022,14 +1061,17 @@ class Trader:
         else:
             sell_price = _dollar_to_cents(market.get('no_bid_dollars')) or _get_no_price_cents(market)
 
+        # Clamp to Kalshi's valid price range (1-99 cents)
+        sell_price = max(1, min(sell_price, 99))
+
         try:
-            # To close: sell the side we bought
+            # To close: sell as limit order at the current bid price
             order_payload = {
                 'ticker': market_id,
                 'action': 'sell',
                 'side': side,
                 'count': quantity,
-                'type': 'market',
+                'type': 'limit',
             }
             if side == 'yes':
                 order_payload['yes_price'] = sell_price

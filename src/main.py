@@ -33,12 +33,20 @@ def start_retrain_scheduler(notifier, logger):
                 from retrain import retrain
                 params = retrain()
                 if params:
+                    yday = params.get('yesterday_accuracy', {})
+                    yday_str = (f"\nYesterday: {yday.get('win_rate', 0):.0%} win rate "
+                                f"({yday.get('total_trades', 0)} trades), "
+                                f"momentum {yday.get('momentum_accuracy', 0):.0%}"
+                                if yday else "\nYesterday: no data")
                     notifier.send_message(
                         f"🧠 Model Retrained (v{params.get('version', '?')})\n\n"
                         f"Data points: {params.get('data_points', 0)}\n"
                         f"Entry range: {params.get('min_entry_price_cents')}¢-{params.get('max_entry_price_cents')}¢\n"
-                        f"Take profit: {params.get('take_profit_pct', 0):.0%}\n"
-                        f"Stop loss: {params.get('stop_loss_pct', 0):.0%}"
+                        f"Stop loss: {params.get('stop_loss_pct', 0):.0%}\n"
+                        f"Breakeven@{params.get('breakeven_trigger', 0.15):.0%} → "
+                        f"Trail@{params.get('trail_trigger', 0.25):.0%} ({params.get('trail_pct', 0.20):.0%})\n"
+                        f"Momentum weight: {params.get('momentum_weight', 1.0)}"
+                        f"{yday_str}"
                     )
                     logger.info("Retraining complete — notified via Telegram")
             except Exception as e:

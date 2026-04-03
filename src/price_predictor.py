@@ -7,9 +7,10 @@ The key question is NOT "will BTC go up or down?" but rather:
 
 For each contract, we estimate:
 1. P(spot crosses strike before expiration) — using recent volatility
-2. Fair value of the contract — P(cross) in cents
-3. Edge — fair value minus market price
-4. Whether the contract is undervalued (buy YES) or overvalued (buy NO)
+2. Momentum — is price trending toward or away from the strike?
+3. Fair value of the contract — adjusted P(cross) in cents
+4. Edge — fair value minus market price
+5. Whether the contract is undervalued (buy YES) or overvalued (buy NO)
 """
 
 import logging
@@ -123,6 +124,101 @@ def compute_realized_volatility(db, asset: str, lookback_hours: int = 24) -> flo
     return max(min(annualized, 3.0), 0.10)
 
 
+def _exponential_weights(n: int, half_life: float) -> np.ndarray:
+    """Generate exponential decay weights where the most recent point has weight 1.
+
+    half_life: number of observations at which weight drops to 0.5.
+    Example: n=10, half_life=3 → oldest point ~0.1, newest point 1.0
+    """
+    decay = math.log(2) / max(half_life, 1)
+    # Index 0 = oldest, n-1 = newest
+    w = np.exp(decay * (np.arange(n, dtype=float) - (n - 1)))
+    return w / np.sum(w)  # Normalize so they sum to 1
+
+
+def compute_momentum(db, asset: str, strike: float, lookback_minutes: int = 10) -> Dict[str, Any]:
+    """Compute short-term momentum relative to the strike price.
+
+    Uses exponentially weighted regression — recent minutes count much more
+    than older ones. Half-life is ~3 observations (3 minutes), so the last
+    3 minutes carry ~50% of the total weight.
+
+    Returns a dict with momentum metrics used to adjust strike probability.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)).isoformat()
+    prices = db.get_crypto_prices(asset=asset, since=since, limit=500)
+
+    result = {
+        "has_data": False,
+        "direction": 0.0,       # +1 = toward strike (above), -1 = away
+        "speed_pct_per_min": 0.0,  # % move per minute
+        "r_squared": 0.0,       # trend confidence (0-1)
+        "price_vs_strike": 0.0, # current distance as % of spot
+        "adjustment": 0.0,      # probability adjustment (-0.15 to +0.15)
+        "data_points": 0,
+    }
+
+    price_vals = [p["price_usd"] for p in prices if p.get("price_usd") and p["price_usd"] > 0]
+    if len(price_vals) < 3:
+        return result
+
+    result["has_data"] = True
+    result["data_points"] = len(price_vals)
+
+    n = len(price_vals)
+    current = price_vals[-1]
+
+    x = np.arange(n, dtype=float)
+    y = np.array(price_vals, dtype=float)
+
+    # Exponential weights: half-life of 3 observations (~3 min)
+    # Last 3 minutes carry ~50% of total weight
+    w = _exponential_weights(n, half_life=3.0)
+
+    # Weighted linear regression
+    w_sum = np.sum(w)  # = 1.0 after normalization, but keep explicit
+    wx_sum = np.sum(w * x)
+    wy_sum = np.sum(w * y)
+    wxy_sum = np.sum(w * x * y)
+    wxx_sum = np.sum(w * x * x)
+
+    denom = w_sum * wxx_sum - wx_sum * wx_sum
+    if denom == 0:
+        return result
+
+    slope = (w_sum * wxy_sum - wx_sum * wy_sum) / denom
+    intercept = (wy_sum - slope * wx_sum) / w_sum
+
+    # Weighted R²
+    y_pred = slope * x + intercept
+    ss_res = np.sum(w * (y - y_pred) ** 2)
+    y_wmean = wy_sum / w_sum
+    ss_tot = np.sum(w * (y - y_wmean) ** 2)
+    r_squared = max(1 - (ss_res / ss_tot) if ss_tot > 0 else 0, 0.0)
+
+    # Weighted speed: use exponentially weighted returns
+    returns = np.diff(y) / y[:-1]  # per-observation returns
+    ret_weights = _exponential_weights(len(returns), half_life=3.0)
+    weighted_speed = float(np.sum(ret_weights * returns))  # weighted avg return per obs
+
+    # Direction relative to strike
+    price_rising = slope > 0
+    direction = 1.0 if price_rising else -1.0
+
+    result["direction"] = direction
+    result["speed_pct_per_min"] = round(weighted_speed * 100, 4)
+    result["r_squared"] = round(r_squared, 3)
+    result["price_vs_strike"] = round((current - strike) / current * 100, 3) if current > 0 else 0
+
+    # Probability adjustment:
+    # direction * |weighted_speed| * trend_confidence, capped at ±15%
+    raw_adj = direction * abs(weighted_speed) * r_squared * 30
+    adjustment = max(-0.15, min(0.15, raw_adj))
+    result["adjustment"] = round(adjustment, 4)
+
+    return result
+
+
 def evaluate_contract(
     db,
     crypto_prices,
@@ -133,6 +229,7 @@ def evaluate_contract(
     no_price_cents: float,
     expiration_time: str,
     asset: str,
+    momentum_weight: float = 1.0,
 ) -> Dict[str, Any]:
     """Evaluate whether a contract is undervalued.
 
@@ -201,8 +298,15 @@ def evaluate_contract(
     else:
         direction = "above"  # YES = price rises above strike
 
-    # Estimate probability that spot crosses strike
-    prob = estimate_strike_probability(spot_price, strike_price, hours_left, vol, direction)
+    # Base probability from log-normal model (static snapshot)
+    base_prob = estimate_strike_probability(spot_price, strike_price, hours_left, vol, direction)
+
+    # Momentum adjustment: is price trending toward or away from strike?
+    # momentum_weight is learned daily — scales the ±15% cap up or down
+    momentum = compute_momentum(db, asset, strike_price)
+    adj = momentum["adjustment"] * momentum_weight  # scaled by learned weight
+    adj = max(-0.15 * momentum_weight, min(0.15 * momentum_weight, adj))
+    prob = max(0.01, min(0.99, base_prob + adj))
 
     # Fair values: prob = chance YES wins
     fair_yes = round(prob * 100, 1)
@@ -214,6 +318,9 @@ def evaluate_contract(
 
     result.update({
         "probability": round(prob, 4),
+        "base_probability": round(base_prob, 4),
+        "momentum_adj": round(adj, 4),
+        "momentum": momentum,
         "fair_value_yes": fair_yes,
         "fair_value_no": fair_no,
         "edge_yes": round(edge_yes, 1),
@@ -233,7 +340,9 @@ def evaluate_contract(
     result["distance_pct"] = round(distance_pct, 2)
     result["reasons"].append(f"Spot ${spot_price:,.0f} vs strike ${strike_price:,.0f} ({distance_pct:.1f}% away)")
     result["reasons"].append(f"Time: {hours_left:.1f}h, Vol: {vol:.0%}")
-    result["reasons"].append(f"P({direction} strike): {prob:.1%}, Fair YES: {fair_yes:.0f}¢, Market: {yes_price_cents:.0f}¢")
+    mom_str = f"Mom: {adj:+.1%}" if momentum["has_data"] else "Mom: no data"
+    result["reasons"].append(f"P({direction}): {base_prob:.1%}→{prob:.1%} ({mom_str}, R²={momentum['r_squared']:.2f})")
+    result["reasons"].append(f"Fair YES: {fair_yes:.0f}¢, Market: {yes_price_cents:.0f}¢")
 
     # Don't trade 15-min contracts when spot is basically at the strike (< 0.05%)
     # This is a coin flip with no real edge

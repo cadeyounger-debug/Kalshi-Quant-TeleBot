@@ -42,8 +42,10 @@ DEFAULT_PARAMS = {
     "min_edge": 0.05,
     "buy_yes_below": 45,
     "buy_no_above": 55,
-    "take_profit_pct": 0.50,
-    "stop_loss_pct": 0.30,
+    "stop_loss_pct": 0.10,
+    "breakeven_trigger": 0.15,
+    "trail_trigger": 0.25,
+    "trail_pct": 0.20,
     "time_exit_seconds": 120,
     "strategy_weights": {
         "news_sentiment": 1.0,
@@ -102,6 +104,14 @@ def query_db(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
 def get_cutoff_date() -> str:
     cutoff = datetime.now(timezone.utc) - timedelta(days=90)
     return cutoff.isoformat()
+
+
+def get_yesterday_range() -> Tuple[str, str]:
+    """Return (start, end) ISO strings for yesterday UTC."""
+    now = datetime.now(timezone.utc)
+    end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +682,128 @@ def analyze_spot_contract_correlation() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Analysis 6: Yesterday's prediction accuracy
+# ---------------------------------------------------------------------------
+def analyze_yesterday_accuracy() -> Dict[str, Any]:
+    """Score how well our model predicted yesterday's 15M contract outcomes.
+
+    For every trade decision we recorded yesterday, compare the predicted
+    probability against what actually happened (did the contract settle YES
+    or NO?). Returns per-asset and per-signal accuracy so we can tune
+    momentum weight, vol weight, and asset weights based on recent performance.
+    """
+    start, end = get_yesterday_range()
+
+    # Get all trade decisions from yesterday
+    decisions = query_db(
+        """SELECT market_ticker, asset, strategy, direction, confidence, timestamp
+           FROM trade_decisions WHERE timestamp >= ? AND timestamp < ?""",
+        (start, end)
+    )
+
+    if not decisions:
+        logger.info("No trade decisions yesterday — skipping accuracy analysis")
+        return {}
+
+    # Get market snapshots to determine outcomes
+    # For 15M contracts: look at last snapshot (near expiry) to see final price
+    snapshots = query_db(
+        """SELECT ticker, yes_bid, yes_ask, no_bid, no_ask, spot_price,
+                  strike_price, timestamp
+           FROM market_snapshots WHERE timestamp >= ? AND timestamp < ?
+           ORDER BY ticker, timestamp""",
+        (start, end)
+    )
+
+    # Group snapshots by ticker — first and last give us entry state vs outcome
+    by_ticker = defaultdict(list)
+    for s in snapshots:
+        by_ticker[s["ticker"]].append(s)
+
+    # Get actual trades and their P&L
+    trades = query_db(
+        """SELECT market_ticker, asset, strategy, side, pnl, price, timestamp
+           FROM trades WHERE timestamp >= ? AND timestamp < ?""",
+        (start, end)
+    )
+
+    # Score predictions
+    results = {
+        "total_decisions": len(decisions),
+        "total_trades": len(trades),
+        "by_asset": defaultdict(lambda: {
+            "correct": 0, "wrong": 0, "total_pnl": 0.0, "trades": 0
+        }),
+        "by_strategy": defaultdict(lambda: {
+            "correct": 0, "wrong": 0, "total_pnl": 0.0, "trades": 0
+        }),
+        "momentum_accuracy": {"correct": 0, "wrong": 0},
+        "overall": {"correct": 0, "wrong": 0},
+    }
+
+    # Score each trade by its P&L (direct measure of prediction accuracy)
+    for t in trades:
+        asset = t.get("asset", "UNKNOWN")
+        strategy = t.get("strategy", "unknown")
+        pnl = t.get("pnl") or 0
+
+        results["by_asset"][asset]["trades"] += 1
+        results["by_asset"][asset]["total_pnl"] += pnl
+        results["by_strategy"][strategy]["trades"] += 1
+        results["by_strategy"][strategy]["total_pnl"] += pnl
+
+        if pnl > 0:
+            results["by_asset"][asset]["correct"] += 1
+            results["by_strategy"][strategy]["correct"] += 1
+            results["overall"]["correct"] += 1
+        elif pnl < 0:
+            results["by_asset"][asset]["wrong"] += 1
+            results["by_strategy"][strategy]["wrong"] += 1
+            results["overall"]["wrong"] += 1
+
+    # Score prediction accuracy by checking if 15M contracts resolved as predicted
+    for ticker, snaps in by_ticker.items():
+        if "15M" not in ticker.upper() or len(snaps) < 2:
+            continue
+
+        first = snaps[0]
+        last = snaps[-1]
+
+        strike = first.get("strike_price") or 0
+        first_spot = first.get("spot_price") or 0
+        last_spot = last.get("spot_price") or 0
+
+        if not (strike > 0 and first_spot > 0 and last_spot > 0):
+            continue
+
+        # Did spot end above or below strike?
+        resolved_above = last_spot > strike
+        # Was spot moving up during the contract?
+        spot_went_up = last_spot > first_spot
+
+        # Check if momentum direction matched outcome
+        results["momentum_accuracy"]["correct" if spot_went_up == resolved_above else "wrong"] += 1
+
+    # Compute summary stats
+    overall = results["overall"]
+    total = overall["correct"] + overall["wrong"]
+    results["win_rate"] = overall["correct"] / total if total > 0 else 0.5
+
+    mom = results["momentum_accuracy"]
+    mom_total = mom["correct"] + mom["wrong"]
+    results["momentum_win_rate"] = mom["correct"] / mom_total if mom_total > 0 else 0.5
+
+    logger.info(f"Yesterday: {total} trades, win_rate={results['win_rate']:.0%}, "
+                f"momentum_accuracy={results['momentum_win_rate']:.0%}")
+    for asset, stats in results["by_asset"].items():
+        t = stats["correct"] + stats["wrong"]
+        wr = stats["correct"] / t if t > 0 else 0
+        logger.info(f"  {asset}: {t} trades, wr={wr:.0%}, pnl=${stats['total_pnl']:.2f}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Compute optimal params from ALL analyses
 # ---------------------------------------------------------------------------
 def compute_optimal_params(
@@ -680,6 +812,7 @@ def compute_optimal_params(
     trade_analysis: Dict,
     sentiment_analysis: Dict,
     spot_correlation: Dict = None,
+    yesterday_accuracy: Dict = None,
 ) -> Dict[str, Any]:
     params = DEFAULT_PARAMS.copy()
     params["trained_at"] = datetime.now(timezone.utc).isoformat()
@@ -863,14 +996,23 @@ def compute_optimal_params(
         neg_moves = [abs(m) for m in all_moves if m < 0]
 
         if pos_moves:
-            # Set take-profit at the 75th percentile of positive moves
-            tp = min(max(float(np.percentile(pos_moves, 75)), 0.15), 0.80)
-            params["take_profit_pct"] = round(tp, 2)
-            logger.info(f"Learned take-profit: {tp:.0%} (from {len(pos_moves)} positive moves)")
+            # Learn trailing params from positive moves
+            # Breakeven trigger: 25th percentile (move stop to entry early)
+            be = min(max(float(np.percentile(pos_moves, 25)), 0.08), 0.25)
+            params["breakeven_trigger"] = round(be, 2)
+            # Trail trigger: 50th percentile (start trailing at typical upside)
+            tt = min(max(float(np.percentile(pos_moves, 50)), 0.15), 0.50)
+            params["trail_trigger"] = round(tt, 2)
+            # Trail distance: tighter when moves are consistent
+            spread = float(np.std(pos_moves))
+            tp = min(max(spread * 1.5, 0.10), 0.35)
+            params["trail_pct"] = round(tp, 2)
+            logger.info(f"Learned trailing: breakeven@{be:.0%}, trail@{tt:.0%}, trail_pct={tp:.0%} "
+                        f"(from {len(pos_moves)} positive moves)")
 
         if neg_moves:
-            # Set stop-loss at the 60th percentile of negative moves
-            sl = min(max(float(np.percentile(neg_moves, 60)), 0.10), 0.50)
+            # Set stop-loss tight — kill losers fast
+            sl = min(max(float(np.percentile(neg_moves, 40)), 0.05), 0.20)
             params["stop_loss_pct"] = round(sl, 2)
             logger.info(f"Learned stop-loss: {sl:.0%} (from {len(neg_moves)} negative moves)")
 
@@ -910,6 +1052,70 @@ def compute_optimal_params(
 
         params["spot_correlations"] = {a: d["correlation"] for a, d in corrs.items()}
 
+    # --- Daily recalibration from yesterday's prediction accuracy ---
+    if yesterday_accuracy and yesterday_accuracy.get("total_trades", 0) >= 2:
+        yesterday_wr = yesterday_accuracy.get("win_rate", 0.5)
+        mom_wr = yesterday_accuracy.get("momentum_win_rate", 0.5)
+
+        # If yesterday's overall win rate was bad, tighten stop loss and raise min edge
+        if yesterday_wr < 0.40:
+            params["stop_loss_pct"] = max(round(params["stop_loss_pct"] * 0.8, 2), 0.05)
+            params["min_edge"] = min(round(params.get("min_edge", 0.05) * 1.3, 2), 0.15)
+            logger.info(f"Yesterday win_rate={yesterday_wr:.0%} — tightening SL to "
+                        f"{params['stop_loss_pct']:.0%}, min_edge to {params['min_edge']}")
+        elif yesterday_wr > 0.65:
+            # Winning streak — slightly loosen to capture more trades
+            params["min_edge"] = max(round(params.get("min_edge", 0.05) * 0.85, 2), 0.03)
+            logger.info(f"Yesterday win_rate={yesterday_wr:.0%} — loosening min_edge to {params['min_edge']}")
+
+        # Tune momentum weight based on yesterday's momentum accuracy
+        # This scales the ±15% cap in price_predictor.compute_momentum
+        current_mom_weight = params.get("momentum_weight", 1.0)
+        if mom_wr > 0.60:
+            # Momentum was predictive — trust it more
+            params["momentum_weight"] = round(min(current_mom_weight * 1.2, 2.0), 2)
+            logger.info(f"Momentum accuracy={mom_wr:.0%} — boosting weight to {params['momentum_weight']}")
+        elif mom_wr < 0.40:
+            # Momentum was counter-predictive — dampen it
+            params["momentum_weight"] = round(max(current_mom_weight * 0.6, 0.2), 2)
+            logger.info(f"Momentum accuracy={mom_wr:.0%} — reducing weight to {params['momentum_weight']}")
+        else:
+            params["momentum_weight"] = round(current_mom_weight, 2)
+
+        # Per-asset tuning: scale asset weights by yesterday's per-asset performance
+        by_asset = yesterday_accuracy.get("by_asset", {})
+        for asset, stats in by_asset.items():
+            t = stats["correct"] + stats["wrong"]
+            if t < 2:
+                continue
+            asset_wr = stats["correct"] / t
+            current_w = params["asset_weights"].get(asset, 1.0)
+            if asset_wr > 0.60:
+                params["asset_weights"][asset] = round(min(current_w * 1.15, 3.0), 2)
+            elif asset_wr < 0.35:
+                params["asset_weights"][asset] = round(max(current_w * 0.7, 0.2), 2)
+            logger.info(f"  {asset}: yesterday wr={asset_wr:.0%} → weight={params['asset_weights'][asset]}")
+
+        # Per-strategy tuning
+        by_strategy = yesterday_accuracy.get("by_strategy", {})
+        for strategy, stats in by_strategy.items():
+            t = stats["correct"] + stats["wrong"]
+            if t < 2:
+                continue
+            strat_wr = stats["correct"] / t
+            current_w = params["strategy_weights"].get(strategy, 1.0)
+            if strat_wr > 0.60:
+                params["strategy_weights"][strategy] = round(min(current_w * 1.2, 3.0), 2)
+            elif strat_wr < 0.35:
+                params["strategy_weights"][strategy] = round(max(current_w * 0.6, 0.2), 2)
+            logger.info(f"  {strategy}: yesterday wr={strat_wr:.0%} → weight={params['strategy_weights'][strategy]}")
+
+        params["yesterday_accuracy"] = {
+            "win_rate": round(yesterday_wr, 3),
+            "momentum_accuracy": round(mom_wr, 3),
+            "total_trades": yesterday_accuracy["total_trades"],
+        }
+
     return params
 
 
@@ -941,6 +1147,9 @@ def retrain():
     logger.info("--- Analyzing spot price vs contract correlation ---")
     spot_correlation = analyze_spot_contract_correlation()
 
+    logger.info("--- Analyzing yesterday's prediction accuracy ---")
+    yesterday_accuracy = analyze_yesterday_accuracy()
+
     # Summary
     logger.info(f"\nSummary:")
     logger.info(f"  Markets observed: {price_analysis.get('total_markets_observed', 0)}")
@@ -949,16 +1158,23 @@ def retrain():
     logger.info(f"  Trades made: {trade_analysis.get('total_trades', 0)}")
     logger.info(f"  Sentiment accuracy: {sentiment_analysis.get('accuracy', 'N/A')}")
     logger.info(f"  Spot correlations: {spot_correlation.get('correlations', {})}")
+    logger.info(f"  Yesterday win rate: {yesterday_accuracy.get('win_rate', 'N/A')}")
+    logger.info(f"  Yesterday momentum accuracy: {yesterday_accuracy.get('momentum_win_rate', 'N/A')}")
 
     # Compute and save
     new_params = compute_optimal_params(
-        price_analysis, missed_analysis, trade_analysis, sentiment_analysis, spot_correlation
+        price_analysis, missed_analysis, trade_analysis, sentiment_analysis,
+        spot_correlation, yesterday_accuracy,
     )
     save_params(new_params)
 
     logger.info(f"\nRetrain complete — v{new_params['version']}")
     logger.info(f"Entry: {new_params['min_entry_price_cents']}-{new_params['max_entry_price_cents']}¢")
-    logger.info(f"TP: {new_params['take_profit_pct']:.0%}, SL: {new_params['stop_loss_pct']:.0%}")
+    logger.info(f"SL: {new_params['stop_loss_pct']:.0%}, "
+                f"BE@{new_params.get('breakeven_trigger', 0.15):.0%}, "
+                f"Trail@{new_params.get('trail_trigger', 0.25):.0%} ({new_params.get('trail_pct', 0.20):.0%})")
+    logger.info(f"Momentum weight: {new_params.get('momentum_weight', 1.0)}")
+    logger.info(f"Min edge: {new_params.get('min_edge', 0.05)}")
     logger.info(f"Strategies: {new_params['strategy_weights']}")
     logger.info(f"Assets: {new_params['asset_weights']}")
 
