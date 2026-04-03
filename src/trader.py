@@ -361,32 +361,39 @@ class Trader:
     def _build_crypto_event_tickers(self):
         """Build list of BTC/ETH/SOL event tickers to watch.
 
-        Covers year-end price, monthly min/max, daily, and hourly events.
+        IMPORTANT: Kalshi 15-min tickers use EASTERN TIME, not UTC.
+        e.g. KXBTC15M-26APR022315 = Apr 2 at 11:15 PM ET
         """
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
 
         tickers = []
-        now = datetime.now()
+        now_utc = datetime.now(timezone.utc)
 
-        # Monthly min/max for current month only (expires end of month)
-        next_m = now.month + 1 if now.month < 12 else 1
-        next_y = now.year if now.month < 12 else now.year + 1
+        # Eastern Time = UTC - 4 (EDT) or UTC - 5 (EST)
+        # April is EDT (daylight saving)
+        ET_OFFSET = timedelta(hours=-4)
+        now_et = now_utc + ET_OFFSET
+
+        # Monthly min/max for current month
+        next_m = now_et.month + 1 if now_et.month < 12 else 1
+        next_y = now_et.year if now_et.month < 12 else now_et.year + 1
         end = datetime(next_y, next_m, 1) - timedelta(days=1)
         dt = end.strftime("%y%b%d").upper()
         for coin, code in [("BTC", "BTC"), ("ETH", "ETH"), ("SOL", "SOL")]:
             tickers.append(f"KX{coin}MAXMON-{code}-{dt}")
             tickers.append(f"KX{coin}MINMON-{code}-{dt}")
 
-        # Daily price events for next 7 days
+        # Daily price events for next 7 days (ET dates)
         for days_ahead in range(0, 7):
-            d = now + timedelta(days=days_ahead)
+            d = now_et + timedelta(days=days_ahead)
             ds = d.strftime("%y%b%d").upper()
             for coin in ["KXBTC", "KXETH", "KXSOL"]:
                 tickers.append(f"{coin}-{ds}0100")
 
-        # 15-minute events for the next 2 hours
-        for mins_ahead in range(0, 120, 15):
-            t = now + timedelta(minutes=mins_ahead)
+        # 15-minute events — use EASTERN TIME for ticker generation
+        # Cover past 30 min (catch closing windows) + next 2 hours
+        for mins_offset in range(-30, 120, 15):
+            t = now_et + timedelta(minutes=mins_offset)
             ds = t.strftime("%y%b%d").upper()
             m15 = (t.minute // 15) * 15
             hm = f"{t.hour:02d}{m15:02d}"
