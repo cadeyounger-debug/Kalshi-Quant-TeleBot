@@ -192,14 +192,19 @@ def evaluate_contract(
     # Get recent realized volatility
     vol = compute_realized_volatility(db, asset)
 
-    # Determine direction from ticker/title
-    # Most Kalshi crypto contracts are "above X" style
-    direction = "above"
+    # Determine direction from ticker
+    # MINMON = "how low will X get" → YES wins if price goes BELOW strike
+    # MAXMON = "how high will X get" → YES wins if price goes ABOVE strike
+    # 15M "up or down" → YES wins if price goes ABOVE target
+    if "MINMON" in ticker.upper() or "MIN" in ticker.upper():
+        direction = "below"  # YES = price drops below strike
+    else:
+        direction = "above"  # YES = price rises above strike
 
-    # Estimate probability
+    # Estimate probability that spot crosses strike
     prob = estimate_strike_probability(spot_price, strike_price, hours_left, vol, direction)
 
-    # Fair values in cents
+    # Fair values: prob = chance YES wins
     fair_yes = round(prob * 100, 1)
     fair_no = round((1 - prob) * 100, 1)
 
@@ -224,7 +229,7 @@ def evaluate_contract(
     result["distance_pct"] = round(distance_pct, 2)
     result["reasons"].append(f"Spot ${spot_price:,.0f} vs strike ${strike_price:,.0f} ({distance_pct:.1f}% away)")
     result["reasons"].append(f"Time: {hours_left:.1f}h, Vol: {vol:.0%}")
-    result["reasons"].append(f"P(above strike): {prob:.1%}, Fair YES: {fair_yes:.0f}¢, Market: {yes_price_cents:.0f}¢")
+    result["reasons"].append(f"P({direction} strike): {prob:.1%}, Fair YES: {fair_yes:.0f}¢, Market: {yes_price_cents:.0f}¢")
 
     if edge_yes >= min_edge and yes_price_cents > 0:
         result["recommendation"] = "buy_yes"
