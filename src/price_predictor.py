@@ -227,7 +227,7 @@ def evaluate_contract(
     # 15-min contracts need bigger edge — thin edge = coin flip
     is_short_term = hours_left < 1
     FEE_CENTS = 4  # 2¢ entry + 2¢ exit
-    min_edge = 15 + FEE_CENTS if is_short_term else 5 + FEE_CENTS  # 19¢ for 15-min, 9¢ for monthly
+    min_edge = 10 + FEE_CENTS if is_short_term else 5 + FEE_CENTS  # 14¢ for 15-min, 9¢ for monthly
 
     distance_pct = abs(spot_price - strike_price) / spot_price * 100
     result["distance_pct"] = round(distance_pct, 2)
