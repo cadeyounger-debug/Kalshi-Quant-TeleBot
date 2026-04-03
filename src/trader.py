@@ -1067,7 +1067,11 @@ class Trader:
             time_exit_secs = self.model_params.get("time_exit_seconds", 120)
             is_15m = '15M' in market_id.upper()
 
-            # --- 15M contracts: use spot price + momentum for exits ---
+            # --- 15M contracts: hold to expiration unless odds are stacked against us ---
+            # Philosophy: we entered because we believed the probability.
+            # Ride it to the end. Only exit early if spot has clearly moved
+            # against us WITH strong momentum confirmation — not on noise.
+            # Target: 100% return (contract settles at $1) or expiration.
             if is_15m:
                 asset = extract_asset(market_id)
                 strike = position.get('strike_price') or _parse_strike_from_ticker(market_id)
@@ -1076,41 +1080,25 @@ class Trader:
                     spot = spot_prices[asset].get("price")
 
                 if spot and strike and strike > 0:
-                    # How far is spot from strike (as % of strike)?
                     spot_distance_pct = (spot - strike) / strike
 
-                    # Get momentum: is spot trending toward or away from our bet?
                     momentum = compute_momentum(self.db, asset, strike)
                     mom_direction = momentum.get("direction", 0)
                     mom_r2 = momentum.get("r_squared", 0)
                     mom_speed = abs(momentum.get("speed_pct_per_min", 0))
 
-                    # Our bet direction: YES = we want spot above strike
-                    #                    NO  = we want spot below strike
                     want_above = (side == 'yes')
-
-                    # Is spot on the wrong side of strike?
                     spot_wrong_side = (want_above and spot < strike) or (not want_above and spot > strike)
-
-                    # Is momentum moving against us?
-                    # mom_direction: +1 = price rising, -1 = price falling
                     momentum_against = (want_above and mom_direction < 0) or (not want_above and mom_direction > 0)
 
-                    # 1. Spot crossed strike AND momentum is against us — get out
-                    if spot_wrong_side and momentum_against and mom_r2 > 0.3:
-                        reason = (f"Spot momentum exit: spot ${spot:,.0f} {'below' if want_above else 'above'} "
-                                  f"strike ${strike:,.0f} ({spot_distance_pct:+.2%}), "
-                                  f"trending against (R²={mom_r2:.2f})")
-
-                    # 2. Spot far on wrong side (>0.3%) — exit regardless of momentum
-                    if not reason and spot_wrong_side and abs(spot_distance_pct) > 0.003:
-                        reason = (f"Spot distance exit: spot ${spot:,.0f} is {abs(spot_distance_pct):.2%} "
-                                  f"{'below' if want_above else 'above'} strike ${strike:,.0f}")
-
-                    # 3. Spot on right side but momentum strongly reversing against us
-                    if not reason and not spot_wrong_side and momentum_against and mom_r2 > 0.5 and mom_speed > 0.01:
-                        reason = (f"Momentum reversal: spot still {'above' if want_above else 'below'} strike "
-                                  f"but trending hard against (R²={mom_r2:.2f}, speed={mom_speed:.3f}%/min)")
+                    # Only exit early when it's clearly over:
+                    # Spot is on wrong side, >0.5% past strike, AND momentum
+                    # is pushing further against us with high confidence
+                    if (spot_wrong_side and abs(spot_distance_pct) > 0.005
+                            and momentum_against and mom_r2 > 0.5):
+                        reason = (f"Conviction exit: spot ${spot:,.0f} is {abs(spot_distance_pct):.2%} "
+                                  f"{'below' if want_above else 'above'} strike ${strike:,.0f}, "
+                                  f"strong trend against (R²={mom_r2:.2f}, speed={mom_speed:.3f}%/min)")
 
             # --- Non-15M contracts: use contract price trailing stop ---
             if not reason and not is_15m:
