@@ -11,7 +11,7 @@ from risk_manager import RiskManager
 from market_data_streamer import MarketDataStreamer
 from performance_analytics import PerformanceAnalytics, Trade
 from settings_manager import SettingsManager
-from db import TradingDB
+from db import TradingDB, extract_asset
 from retrain import load_current_params, PARAMS_PATH
 from crypto_prices import get_default as get_crypto_prices
 from price_predictor import predict_direction, evaluate_contract
