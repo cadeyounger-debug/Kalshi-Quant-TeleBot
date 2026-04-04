@@ -166,6 +166,12 @@ class KalshiAPI:
     def create_order(self, order_payload):
         return self._handle_request("POST", "/portfolio/orders", json=order_payload)
 
+    def get_order(self, order_id):
+        return self._handle_request("GET", f"/portfolio/orders/{order_id}")
+
+    def get_fills(self, params=None):
+        return self._handle_request("GET", "/portfolio/fills", params=params or {})
+
     def cancel_order(self, order_id):
         return self._handle_request("DELETE", f"/portfolio/orders/{order_id}")
 
