@@ -926,40 +926,91 @@ class Trader:
             self.logger.info(f"Order payload: {order_payload}")
 
             result = self.api.create_order(order_payload)
-            if result:
-                self.logger.info(f"ORDER PLACED: {result}")
+            if not result:
+                self.logger.error(f"Order failed for {event_id} — API returned None")
+                return
 
-                # Use actual filled quantity, not requested
-                order_info = result.get('order', {})
+            order_info = result.get('order', {})
+            order_id = order_info.get('order_id')
+            order_status = order_info.get('status', 'unknown')
+            self.logger.info(f"ORDER RESPONSE: id={order_id}, status={order_status}, full={result}")
+
+            # Check fill status — Kalshi returns status: executed, resting, canceled, pending
+            filled_qty = 0
+            if order_status in ('executed', 'filled'):
+                # Fully filled
                 filled_str = order_info.get('fill_count_fp', str(quantity))
                 filled_qty = int(float(filled_str)) if filled_str else quantity
-                if filled_qty == 0:
-                    filled_qty = quantity  # Resting order, may fill later
-                elif filled_qty < quantity:
-                    self.logger.info(f"Partial fill: {filled_qty}/{quantity} contracts filled")
-
+                self.logger.info(f"ORDER FILLED: {filled_qty} contracts of {event_id}")
+            elif order_status == 'resting':
+                # Limit order sitting on book — poll briefly for fill
+                filled_str = order_info.get('fill_count_fp', '0')
+                filled_qty = int(float(filled_str)) if filled_str else 0
+                if filled_qty == 0 and order_id:
+                    # Wait up to 5s checking every 1s for fill
+                    for _poll in range(5):
+                        time.sleep(1)
+                        poll_result = self.api.get_order(order_id)
+                        if poll_result:
+                            poll_order = poll_result.get('order', {})
+                            poll_status = poll_order.get('status', 'resting')
+                            poll_filled = poll_order.get('fill_count_fp', '0')
+                            filled_qty = int(float(poll_filled)) if poll_filled else 0
+                            self.logger.info(f"Poll {_poll+1}: status={poll_status}, filled={filled_qty}")
+                            if poll_status in ('executed', 'filled') or filled_qty > 0:
+                                break
+                    if filled_qty == 0:
+                        # Still unfilled — cancel the resting order, don't pretend we traded
+                        self.logger.warning(f"Order {order_id} still resting after 5s — cancelling")
+                        self.api.cancel_order(order_id)
+                        self.db.record_trade(
+                            event_id, side=side, quantity=0, price=price_cents,
+                            strategy=strategy, order_result=f"CANCELLED_UNFILLED:{order_id}",
+                        )
+                        return
+                    else:
+                        self.logger.info(f"ORDER FILLED after polling: {filled_qty} contracts")
+            elif order_status == 'canceled':
+                self.logger.warning(f"Order was immediately canceled by exchange: {result}")
                 self.db.record_trade(
-                    event_id,
-                    side=side,
-                    quantity=filled_qty,
-                    price=price_cents,
-                    strategy=strategy,
-                    order_result=str(result),
-                    edge_cents=trade_decision.get('edge_cents'),
-                    predicted_prob=trade_decision.get('predicted_probability'),
-                    fair_value=trade_decision.get('fair_value'),
-                    spot_price=trade_decision.get('spot_price'),
-                    strike_price=trade_decision.get('strike_price'),
+                    event_id, side=side, quantity=0, price=price_cents,
+                    strategy=strategy, order_result=f"EXCHANGE_CANCELED:{result}",
                 )
-            else:
-                self.logger.error(f"Order failed for {event_id}")
                 return
+            else:
+                # Unknown status — log and treat as failed
+                self.logger.error(f"Unexpected order status '{order_status}': {result}")
+                self.db.record_trade(
+                    event_id, side=side, quantity=0, price=price_cents,
+                    strategy=strategy, order_result=f"UNKNOWN_STATUS:{result}",
+                )
+                return
+
+            if filled_qty == 0:
+                self.logger.warning(f"Zero fill quantity for {event_id}, skipping position tracking")
+                return
+
+            self.db.record_trade(
+                event_id,
+                side=side,
+                quantity=filled_qty,
+                price=price_cents,
+                strategy=strategy,
+                order_result=f"FILLED:{order_id}:qty={filled_qty}",
+                edge_cents=trade_decision.get('edge_cents'),
+                predicted_prob=trade_decision.get('predicted_probability'),
+                fair_value=trade_decision.get('fair_value'),
+                spot_price=trade_decision.get('spot_price'),
+                strike_price=trade_decision.get('strike_price'),
+            )
 
             # Place a resting limit sell as a hard stop loss on the exchange.
             # This fires instantly via Kalshi's matching engine instead of
             # waiting for our 60s polling loop. The momentum-based exits
             # handle smart exits; this is the emergency parachute.
-            stop_price = max(1, int(price_cents * 0.70))  # Hard floor at 30% loss
+            sl_pct = self.model_params.get("stop_loss_pct", 0.30)
+            sl_pct = min(sl_pct, 0.30)  # Never wider than 30%
+            stop_price = max(1, int(price_cents * (1 - sl_pct)))
             stop_payload = {
                 'ticker': event_id,
                 'action': 'sell',
@@ -1011,16 +1062,17 @@ class Trader:
             self.current_positions[event_id] = position
             self.db.save_position(event_id, position)
 
-            # Send clean trade notification
+            # Send clean trade notification — only reaches here if actually filled
             title = trade_decision.get('title', event_id)
             reason = trade_decision.get('reason', strategy)
             price_dollars = f"${price_cents / 100:.2f}"
             self.notifier.send_message(
-                f"🔔 Trade Opened\n\n"
+                f"🔔 Trade Filled\n\n"
                 f"{title}\n"
-                f"{side.upper()} {quantity} contract{'s' if quantity > 1 else ''} @ {price_dollars}\n"
+                f"{side.upper()} {filled_qty} contract{'s' if filled_qty > 1 else ''} @ {price_dollars}\n"
                 f"Strategy: {strategy}\n"
-                f"Reason: {reason}"
+                f"Reason: {reason}\n"
+                f"Order: {order_id}"
             )
 
         except Exception as e:
@@ -1209,35 +1261,65 @@ class Trader:
             self.logger.info(f"Closing position: {order_payload}")
             result = self.api.create_order(order_payload)
 
-            if result:
-                # P&L = (sell price - entry price) * quantity, always same logic
-                pnl_cents = (sell_price - entry) * quantity
+            if not result:
+                self.logger.error(f"Failed to close position {market_id} — API returned None")
+                return
 
-                pnl_dollars = pnl_cents / 100
+            close_order = result.get('order', {})
+            close_order_id = close_order.get('order_id')
+            close_status = close_order.get('status', 'unknown')
+            self.logger.info(f"CLOSE ORDER: id={close_order_id}, status={close_status}")
 
-                # Record to db
-                self.db.record_trade(
-                    market_id, side=side, quantity=quantity, price=sell_price,
-                    strategy=position.get('strategy', ''), order_result=f"CLOSE: {reason}",
-                    pnl=pnl_dollars,
-                )
+            # Check if the close order actually filled
+            close_filled = 0
+            if close_status in ('executed', 'filled'):
+                filled_str = close_order.get('fill_count_fp', str(quantity))
+                close_filled = int(float(filled_str)) if filled_str else quantity
+            elif close_status == 'resting' and close_order_id:
+                # Poll for fill — exits are time-sensitive
+                for _poll in range(5):
+                    time.sleep(1)
+                    poll_result = self.api.get_order(close_order_id)
+                    if poll_result:
+                        poll_order = poll_result.get('order', {})
+                        poll_filled = poll_order.get('fill_count_fp', '0')
+                        close_filled = int(float(poll_filled)) if poll_filled else 0
+                        if poll_order.get('status') in ('executed', 'filled') or close_filled > 0:
+                            break
+                if close_filled == 0:
+                    self.logger.warning(f"Close order {close_order_id} unfilled after 5s — leaving resting")
+                    # Don't cancel close orders — we want the position closed
+                    return
 
-                # Remove position from memory and database
-                del self.current_positions[market_id]
-                self.db.delete_position(market_id)
+            if close_filled == 0:
+                self.logger.warning(f"Close order for {market_id} did not fill")
+                return
 
-                # Notify
-                pnl_emoji = "🟢" if pnl_dollars >= 0 else "🔴"
-                self.notifier.send_message(
-                    f"🔔 Position Closed\n\n"
-                    f"{title}\n"
-                    f"{side.upper()} — Entry: {entry}¢ → Exit: {sell_price}¢\n"
-                    f"P&L: {pnl_emoji} ${pnl_dollars:.2f}\n"
-                    f"Reason: {reason}"
-                )
-                self.logger.info(f"Closed {market_id} ({side}): {entry}¢→{sell_price}¢, P&L ${pnl_dollars:.2f}, {reason}")
-            else:
-                self.logger.error(f"Failed to close position {market_id}")
+            # P&L = (sell price - entry price) * quantity, always same logic
+            pnl_cents = (sell_price - entry) * close_filled
+            pnl_dollars = pnl_cents / 100
+
+            # Record to db
+            self.db.record_trade(
+                market_id, side=side, quantity=close_filled, price=sell_price,
+                strategy=position.get('strategy', ''), order_result=f"CLOSE_FILLED:{close_order_id}:{reason}",
+                pnl=pnl_dollars,
+            )
+
+            # Remove position from memory and database
+            del self.current_positions[market_id]
+            self.db.delete_position(market_id)
+
+            # Notify
+            pnl_emoji = "🟢" if pnl_dollars >= 0 else "🔴"
+            self.notifier.send_message(
+                f"🔔 Position Closed\n\n"
+                f"{title}\n"
+                f"{side.upper()} — Entry: {entry}¢ → Exit: {sell_price}¢\n"
+                f"P&L: {pnl_emoji} ${pnl_dollars:.2f}\n"
+                f"Reason: {reason}"
+            )
+            self.logger.info(f"Closed {market_id} ({side}): {entry}¢→{sell_price}¢, P&L ${pnl_dollars:.2f}, {reason}")
 
         except Exception as e:
             self.logger.error(f"Error closing position {market_id}: {e}")

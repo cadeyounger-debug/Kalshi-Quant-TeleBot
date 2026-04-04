@@ -178,3 +178,37 @@ def test_stop_loss_uses_filled_quantity():
     # Position should track 1 contract
     pos = trader.current_positions.get('KXBTC15M-TEST', {})
     assert pos.get('quantity') == 1, f"Position quantity should be 1 (filled), got {pos.get('quantity')}"
+
+
+def test_stop_loss_uses_learned_pct():
+    """Resting stop loss price should use model_params stop_loss_pct."""
+    from trader import Trader
+    from unittest.mock import MagicMock, patch
+
+    api = MagicMock()
+    api.create_order.side_effect = [
+        {'order': {'order_id': 'buy-1', 'fill_count_fp': '1.00', 'status': 'filled'}},
+        {'order': {'order_id': 'stop-1'}},
+    ]
+
+    with patch('trader.load_current_params', return_value={
+        'version': 1, 'momentum_weight': 1.0, 'stop_loss_pct': 0.15,
+    }), \
+         patch('trader.PerformanceAnalytics'), \
+         patch('trader.MarketDataStreamer'), \
+         patch('trader.SettingsManager') as sm_mock:
+        sm_mock.return_value.settings = MagicMock()
+        sm_mock.return_value.add_change_listener = MagicMock()
+        trader = Trader(api, MagicMock(), MagicMock(), bankroll=1000)
+
+    trader.execute_trade({
+        'event_id': 'KXBTC15M-TEST2', 'action': 'buy', 'side': 'yes',
+        'quantity': 1, 'price': 60, 'strategy': 'value_bet',
+        'title': 'Test', 'expiration_time': '2026-04-04T00:00:00Z',
+        'confidence': 0.5, 'spot_price': 67000, 'strike_price': 67000,
+    })
+
+    stop_payload = api.create_order.call_args_list[1][0][0]
+    stop_price = stop_payload.get('yes_price')
+    # 60 * (1 - 0.15) = 51
+    assert stop_price == 51, f"Stop should be 51¢ (15% below 60¢), got {stop_price}¢"
