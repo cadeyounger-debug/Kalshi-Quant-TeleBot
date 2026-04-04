@@ -15,6 +15,9 @@ from db import TradingDB, extract_asset
 from retrain import load_current_params, PARAMS_PATH
 from crypto_prices import get_default as get_crypto_prices
 from price_predictor import predict_direction, evaluate_contract
+from hmm_shadow import ShadowTracker
+from hmm_regime import RegimeEngine
+from hmm_contract import evaluate_contract_with_regime
 import re
 
 
@@ -151,6 +154,10 @@ class Trader:
         # Track recently-closed positions to prevent instant re-entry
         self._recently_closed = {}  # {market_id: close_timestamp}
         self._reentry_cooldown = 120  # 2 minutes before re-entering a closed market
+
+        # HMM regime system (shadow mode)
+        self.hmm_shadow = ShadowTracker(self.db)
+        self.hmm_regime = RegimeEngine(self.db)
 
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
@@ -533,6 +540,78 @@ class Trader:
                     spot_price=current_spot,
                     expiration_time=m.get("expected_expiration_time") or m.get("expiration_time") or m.get("close_time"),
                 )
+
+            # HMM shadow prediction (parallel to existing strategy, no execution)
+            try:
+                spot_prices = getattr(self, '_current_spot_prices', {})
+                for asset in ["BTC", "ETH", "SOL"]:
+                    posterior = self.hmm_regime.get_current_posterior(asset)
+                    if posterior is None:
+                        continue
+
+                    prefix = f"KX{asset}15M"
+                    active_15m = [m for m in markets if m.get('ticker', '').upper().startswith(prefix)]
+                    if not active_15m:
+                        continue
+                    contract = active_15m[0]
+                    ticker = contract.get('ticker', '')
+
+                    strike = contract.get('strike_price') or _parse_strike_from_ticker(ticker)
+                    spot = spot_prices.get(asset, {}).get("price") if spot_prices else None
+                    if not spot or not strike or strike <= 0:
+                        continue
+
+                    yes_price = _get_market_price_cents(contract)
+                    no_price = _get_no_price_cents(contract)
+                    exp_time = contract.get('expected_expiration_time') or contract.get('expiration_time')
+
+                    tte_secs = 900
+                    if exp_time:
+                        try:
+                            from datetime import datetime, timezone
+                            exp_dt = datetime.fromisoformat(exp_time.replace("Z", "+00:00"))
+                            tte_secs = max(0, (exp_dt - datetime.now(timezone.utc)).total_seconds())
+                        except (ValueError, TypeError):
+                            pass
+
+                    from price_predictor import estimate_strike_probability, compute_realized_volatility
+                    vol = compute_realized_volatility(self.db, asset)
+                    base_prob = estimate_strike_probability(spot, strike, tte_secs / 3600, vol)
+
+                    n_states = len(posterior)
+                    state_profiles = [
+                        {"win_rate": 0.5, "avg_win_cents": 0, "avg_loss_cents": 0, "trade_count": 0}
+                        for _ in range(n_states)
+                    ]
+
+                    bid_ask = ((contract.get('yes_ask') or 0) - (contract.get('yes_bid') or 0)) * 100
+
+                    hmm_eval = evaluate_contract_with_regime(
+                        regime_posterior=posterior, state_profiles=state_profiles,
+                        spot_price=spot, strike_price=strike,
+                        yes_price_cents=yes_price, no_price_cents=no_price,
+                        time_to_expiry_secs=tte_secs,
+                        contract_volume=int(float(contract.get('volume', 0) or 0)),
+                        bid_ask_spread_cents=bid_ask, log_normal_prob=base_prob,
+                        bankroll=self.risk_manager.current_bankroll,
+                    )
+
+                    entropy = self.hmm_regime.get_regime_entropy(posterior)
+                    self.hmm_shadow.record_prediction(
+                        asset=asset, ticker=ticker,
+                        regime_posterior=posterior, regime_entropy=entropy,
+                        fair_prob=hmm_eval.fair_prob, market_price=yes_price,
+                        edge_cents=hmm_eval.edge_yes_cents, ev_cents=hmm_eval.ev_cents,
+                        confidence=hmm_eval.confidence,
+                        recommendation=hmm_eval.recommendation,
+                        position_size=hmm_eval.position_size,
+                    )
+
+                    self.logger.info(f"HMM shadow {asset}: regime=[{','.join(f'{p:.2f}' for p in posterior[:3])}...], "
+                                     f"rec={hmm_eval.recommendation}, edge={hmm_eval.edge_yes_cents:+.0f}c, "
+                                     f"EV={hmm_eval.ev_cents:.1f}c")
+            except Exception as e:
+                self.logger.debug(f"HMM shadow error: {e}")
 
             market_data = {"markets": markets}
             trade_decision = self._make_trade_decision(market_data)

@@ -1178,6 +1178,32 @@ def retrain():
     logger.info(f"Strategies: {new_params['strategy_weights']}")
     logger.info(f"Assets: {new_params['asset_weights']}")
 
+    # --- HMM Regime Model Retrain ---
+    try:
+        from hmm_regime import RegimeEngine
+        from hmm_shadow import ShadowTracker
+        from db import TradingDB
+
+        hmm_db = TradingDB(db_path=DB_PATH)
+        engine = RegimeEngine(hmm_db)
+        results = engine.fit_all_assets()
+
+        shadow = ShadowTracker(hmm_db)
+        shadow_report = shadow.format_report(days=7)
+
+        logger.info("--- HMM Regime Retrain ---")
+        for asset, result in results.items():
+            if result:
+                logger.info(f"  {asset}: K={result['n_states']}, BIC={result['bic']:.1f}, "
+                           f"stability={result['stability_flags']}")
+            else:
+                logger.info(f"  {asset}: insufficient data")
+        logger.info(shadow_report)
+    except ImportError:
+        logger.info("HMM modules not available — skipping regime retrain")
+    except Exception as e:
+        logger.error(f"HMM retrain error: {e}")
+
     return new_params
 
 
