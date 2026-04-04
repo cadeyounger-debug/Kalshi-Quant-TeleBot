@@ -210,8 +210,8 @@ def test_stop_loss_uses_learned_pct():
 
     stop_payload = api.create_order.call_args_list[1][0][0]
     stop_price = stop_payload.get('yes_price')
-    # 60 * (1 - 0.15) = 51
-    assert stop_price == 51, f"Stop should be 51¢ (15% below 60¢), got {stop_price}¢"
+    # fill_price = 61 (60+1), sl_distance = max(int(61*0.15), 9) = 9, stop = 61-9 = 52
+    assert stop_price == 52, f"Stop should be 52¢ (9¢ below fill at 61¢), got {stop_price}¢"
 
 
 def test_15m_no_volume_boost():

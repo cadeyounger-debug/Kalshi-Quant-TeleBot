@@ -120,8 +120,11 @@ def compute_realized_volatility(db, asset: str, lookback_hours: int = 24) -> flo
     std_dev = float(np.std(returns))
     annualized = std_dev * math.sqrt(obs_per_year)
 
-    # Clamp to reasonable range
-    return max(min(annualized, 3.0), 0.10)
+    # Clamp to reasonable range — floor at 40% for crypto (never assume low vol)
+    # Our price samples are ~60s apart from a cached API, which smooths out
+    # real intra-minute volatility. 10% floor was way too low and made the
+    # model overconfident on near-strike contracts.
+    return max(min(annualized, 3.0), 0.40)
 
 
 def _exponential_weights(n: int, half_life: float) -> np.ndarray:
@@ -349,6 +352,18 @@ def evaluate_contract(
     if is_short_term and 0.48 < prob < 0.52:
         result["recommendation"] = "skip"
         result["reasons"].append(f"Probability {prob:.0%} too close to 50/50 — no conviction")
+        return result
+
+    # Market disagreement check: if our model and the market disagree by >20pp,
+    # the market is almost certainly more right (it has order flow info we don't).
+    # Skip when the disagreement is too large — we're probably miscalibrated.
+    market_implied_yes = yes_price_cents / 100.0 if yes_price_cents else 0.5
+    model_market_gap = abs(prob - market_implied_yes)
+    if is_short_term and model_market_gap > 0.20:
+        result["recommendation"] = "skip"
+        result["reasons"].append(
+            f"Model-market disagreement too large: model={prob:.0%} vs market={market_implied_yes:.0%} "
+            f"(gap={model_market_gap:.0%}). Market likely knows something we don't.")
         return result
 
     # Only buy the side we think actually wins (prob > 50%)
