@@ -341,13 +341,6 @@ def evaluate_contract(
     result["reasons"].append(f"P({direction}): {base_prob:.1%}→{prob:.1%} ({mom_str}, R²={momentum['r_squared']:.2f})")
     result["reasons"].append(f"Fair YES: {fair_yes:.0f}¢, Market: {yes_price_cents:.0f}¢")
 
-    # Don't trade 15-min contracts when spot is basically at the strike (< 0.05%)
-    # This is a coin flip with no real edge
-    if is_short_term and distance_pct < 0.05:
-        result["recommendation"] = "skip"
-        result["reasons"].append(f"Spot too close to strike ({distance_pct:.2f}%) — coin flip, skipping")
-        return result
-
     # Don't trade 15-min when probability is between 45-55% (no conviction)
     if is_short_term and 0.45 < prob < 0.55:
         result["recommendation"] = "skip"
