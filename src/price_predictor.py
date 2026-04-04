@@ -341,8 +341,8 @@ def evaluate_contract(
     result["reasons"].append(f"P({direction}): {base_prob:.1%}→{prob:.1%} ({mom_str}, R²={momentum['r_squared']:.2f})")
     result["reasons"].append(f"Fair YES: {fair_yes:.0f}¢, Market: {yes_price_cents:.0f}¢")
 
-    # Don't trade 15-min when probability is between 45-55% (no conviction)
-    if is_short_term and 0.45 < prob < 0.55:
+    # Don't trade 15-min when probability is between 48-52% (true coin flip)
+    if is_short_term and 0.48 < prob < 0.52:
         result["recommendation"] = "skip"
         result["reasons"].append(f"Probability {prob:.0%} too close to 50/50 — no conviction")
         return result
