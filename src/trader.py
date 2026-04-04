@@ -744,6 +744,7 @@ class Trader:
                 expiration_time=exp_time,
                 asset=asset,
                 momentum_weight=self.model_params.get("momentum_weight", 1.0),
+                min_edge_override=self.model_params.get("min_edge") if self.model_params.get("min_edge") else None,
             )
 
             vol_str = f"vol={c['volume']}, OI={c['open_interest']}"

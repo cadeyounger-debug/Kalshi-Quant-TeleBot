@@ -97,3 +97,33 @@ def test_momentum_cap_fixed_at_15_pct():
     assert result["momentum_adj"] <= 0.15, (
         f"Momentum adj should be capped at 0.15, got {result['momentum_adj']}"
     )
+
+
+def test_min_edge_from_param():
+    """evaluate_contract should respect min_edge_override parameter."""
+    # With default 5¢ min_edge, P=60% fair=60 market=48 edge=+12 => should trade
+    result_default = _eval(0.60, yes_price=48, no_price=52)
+    assert result_default["recommendation"] == "buy_yes"
+
+    # With 15¢ min_edge override, same 12¢ edge should skip
+    db = _make_mock_db()
+    crypto = MagicMock()
+    from datetime import datetime, timedelta, timezone
+    exp = (datetime.now(timezone.utc) + timedelta(hours=0.2)).isoformat()
+
+    with patch('price_predictor.estimate_strike_probability', return_value=0.60), \
+         patch('price_predictor.compute_realized_volatility', return_value=0.50), \
+         patch('price_predictor.compute_momentum', return_value={
+             "has_data": False, "direction": 0, "speed_pct_per_min": 0,
+             "r_squared": 0, "price_vs_strike": 0, "adjustment": 0, "data_points": 0,
+         }):
+        result_strict = evaluate_contract(
+            db=db, crypto_prices=crypto, ticker="KXBTC15M-TEST",
+            strike_price=67000, spot_price=67100, yes_price_cents=48,
+            no_price_cents=52, expiration_time=exp, asset="BTC",
+            min_edge_override=15,
+        )
+
+    assert result_strict["recommendation"] == "skip", (
+        f"With min_edge=15, a 12¢ edge should skip, got {result_strict['recommendation']}"
+    )

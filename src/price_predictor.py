@@ -230,6 +230,7 @@ def evaluate_contract(
     expiration_time: str,
     asset: str,
     momentum_weight: float = 1.0,
+    min_edge_override: float = None,
 ) -> Dict[str, Any]:
     """Evaluate whether a contract is undervalued.
 
@@ -331,7 +332,10 @@ def evaluate_contract(
 
     # Minimum edge: 5¢ for 15-min (4¢ fees + 1¢ profit), 9¢ for longer
     is_short_term = hours_left < 1
-    min_edge = 5 if is_short_term else 9
+    if min_edge_override is not None:
+        min_edge = min_edge_override
+    else:
+        min_edge = 5 if is_short_term else 9
 
     distance_pct = abs(spot_price - strike_price) / spot_price * 100
     result["distance_pct"] = round(distance_pct, 2)
