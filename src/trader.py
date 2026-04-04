@@ -148,6 +148,10 @@ class Trader:
             self.current_positions = kept
             self.logger.info(f"Restored {len(kept)} open positions ({len(restored) - len(kept)} expired/dropped)")
 
+        # Track recently-closed positions to prevent instant re-entry
+        self._recently_closed = {}  # {market_id: close_timestamp}
+        self._reentry_cooldown = 120  # 2 minutes before re-entering a closed market
+
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
         self.market_data_streamer = MarketDataStreamer(
@@ -888,6 +892,19 @@ class Trader:
         price = trade_decision['price']
         strategy = trade_decision.get('strategy', 'unknown')
 
+        # Don't re-enter a market we just closed
+        closed_at = self._recently_closed.get(event_id)
+        if closed_at and (time.time() - closed_at) < self._reentry_cooldown:
+            mins_left = (self._reentry_cooldown - (time.time() - closed_at)) / 60
+            self.logger.info(f"Skipping {event_id} — closed {time.time() - closed_at:.0f}s ago, "
+                             f"cooldown {mins_left:.1f}min remaining")
+            return
+
+        # Purge stale entries from recently_closed
+        now = time.time()
+        self._recently_closed = {k: v for k, v in self._recently_closed.items()
+                                  if now - v < self._reentry_cooldown}
+
         # Price from strategies is already in cents (1-99) via _get_market_price_cents
         price_cents = int(price)
 
@@ -1004,13 +1021,29 @@ class Trader:
                 strike_price=trade_decision.get('strike_price'),
             )
 
+            # Determine actual fill price from order response
+            # Kalshi returns yes/no_sub_total_dollars or we fall back to our limit price
+            actual_fill = fill_price  # default to our limit price
+            sub_total_field = 'yes_sub_total_dollars' if side == 'yes' else 'no_sub_total_dollars'
+            sub_total = order_info.get(sub_total_field)
+            if sub_total and filled_qty > 0:
+                actual_fill = round(float(sub_total) * 100 / filled_qty)
+            elif order_info.get('average_price'):
+                avg_p = float(order_info['average_price'])
+                actual_fill = int(avg_p) if avg_p > 1 else round(avg_p * 100)
+
             # Place a resting limit sell as a hard stop loss on the exchange.
-            # This fires instantly via Kalshi's matching engine instead of
-            # waiting for our 60s polling loop. The momentum-based exits
-            # handle smart exits; this is the emergency parachute.
+            # Stop distance must clear round-trip fees AND leave room for noise.
+            # Without this, a 3¢ dip triggers exit and fees eat the whole position.
+            fee_cents = 4  # 2¢ entry + 2¢ exit
+            noise_buffer = 5  # minimum cents of real price movement before stop fires
             sl_pct = self.model_params.get("stop_loss_pct", 0.10)
             sl_pct = min(sl_pct, 0.30)  # Never wider than 30%
-            stop_price = max(1, int(price_cents * (1 - sl_pct)))
+            # Stop distance = max(percentage-based, fees + noise buffer)
+            pct_distance = int(actual_fill * sl_pct)
+            min_distance = fee_cents + noise_buffer  # 9¢ floor: 4¢ fees + 5¢ real movement
+            sl_distance = max(pct_distance, min_distance)
+            stop_price = max(1, actual_fill - sl_distance)
             stop_payload = {
                 'ticker': event_id,
                 'action': 'sell',
@@ -1028,7 +1061,9 @@ class Trader:
             if stop_result:
                 stop_order_id = stop_result.get('order', {}).get('order_id')
                 self.logger.info(f"STOP LOSS placed: sell {side} @ {stop_price}¢ "
-                                 f"(order_id={stop_order_id})")
+                                 f"(fill={actual_fill}¢, distance={sl_distance}¢ "
+                                 f"[{pct_distance}¢ pct / {min_distance}¢ floor], "
+                                 f"order_id={stop_order_id})")
             else:
                 self.logger.warning(f"Failed to place stop loss for {event_id}")
 
@@ -1047,7 +1082,7 @@ class Trader:
             # Store position locally and persist to database
             position = {
                 'quantity': filled_qty,
-                'entry_price': price_cents,
+                'entry_price': actual_fill,
                 'side': side,
                 'type': 'long' if action.lower() == 'buy' else 'short',
                 'strategy': strategy,
@@ -1308,6 +1343,9 @@ class Trader:
             # Remove position from memory and database
             del self.current_positions[market_id]
             self.db.delete_position(market_id)
+
+            # Mark as recently closed to prevent instant re-entry
+            self._recently_closed[market_id] = time.time()
 
             # Notify
             pnl_emoji = "🟢" if pnl_dollars >= 0 else "🔴"
