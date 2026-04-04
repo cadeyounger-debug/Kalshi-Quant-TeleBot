@@ -32,20 +32,24 @@ def _eval(prob_override, yes_price=40, no_price=60, hours_left=0.2):
         )
 
 
-def test_prob_53_can_buy_yes():
-    """P=53% should buy YES — not blocked by no-conviction band."""
-    result = _eval(0.53, yes_price=40, no_price=60)
+def test_prob_65_can_buy_yes():
+    """P=65% with market agreeing (yes_price=50) should buy YES with 10¢+ edge."""
+    result = _eval(0.65, yes_price=50, no_price=50)
+    # Model says 65% YES, market implied YES = 50% (>45% = agrees YES direction)
+    # Edge = 65 - 50 = 15¢ >= 10¢ min
     assert result["recommendation"] == "buy_yes", (
-        f"P=53% with edge should buy YES, got {result['recommendation']}. "
+        f"P=65% with market agreement and 15¢ edge should buy YES, got {result['recommendation']}. "
         f"Reasons: {result['reasons']}"
     )
 
 
-def test_prob_47_can_buy_no():
-    """P=47% means P(NO)=53% — should buy NO."""
-    result = _eval(0.47, yes_price=60, no_price=40)
+def test_prob_35_can_buy_no():
+    """P=35% (NO=65%) with market agreeing (yes_price=30) should buy NO."""
+    result = _eval(0.35, yes_price=30, no_price=55)
+    # Model says 35% YES (65% NO), market implied YES = 30% (<45% = agrees NO direction)
+    # Edge NO = 65 - 55 = 10¢ >= 10¢ min
     assert result["recommendation"] == "buy_no", (
-        f"P=47% (P(NO)=53%) with edge should buy NO, got {result['recommendation']}. "
+        f"P=35% (NO=65%) with market agreement and 10¢ edge should buy NO, got {result['recommendation']}. "
         f"Reasons: {result['reasons']}"
     )
 

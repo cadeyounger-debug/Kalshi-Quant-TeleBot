@@ -354,26 +354,31 @@ def evaluate_contract(
         result["reasons"].append(f"Probability {prob:.0%} too close to 50/50 — no conviction")
         return result
 
-    # Market disagreement check: if our model and the market disagree by >20pp,
-    # the market is almost certainly more right (it has order flow info we don't).
-    # Skip when the disagreement is too large — we're probably miscalibrated.
+    # Market agreement check: model and market must agree on DIRECTION.
+    # If model says YES (prob>50%) but market prices YES below 40¢, the market
+    # disagrees on direction — skip. We only trade when both agree and the
+    # market is underpricing the winning side by at least 10¢.
     market_implied_yes = yes_price_cents / 100.0 if yes_price_cents else 0.5
-    model_market_gap = abs(prob - market_implied_yes)
-    if is_short_term and model_market_gap > 0.20:
+    model_says_yes = prob > 0.50
+    market_says_yes = market_implied_yes > 0.45  # Market leans YES above 45¢
+
+    if is_short_term and model_says_yes != market_says_yes:
         result["recommendation"] = "skip"
         result["reasons"].append(
-            f"Model-market disagreement too large: model={prob:.0%} vs market={market_implied_yes:.0%} "
-            f"(gap={model_market_gap:.0%}). Market likely knows something we don't.")
+            f"Model-market direction mismatch: model={'YES' if model_says_yes else 'NO'} "
+            f"vs market implied={market_implied_yes:.0%}. Need agreement on direction.")
         return result
 
+    # Higher conviction bar: 10¢ min edge for 15M contracts
+    effective_min_edge = max(min_edge, 10) if is_short_term else min_edge
+
     # Only buy the side we think actually wins (prob > 50%)
-    # A "good price" on the losing side is still a losing bet
-    if prob > 0.50 and edge_yes >= min_edge and yes_price_cents > 0:
+    if prob > 0.50 and edge_yes >= effective_min_edge and yes_price_cents > 0:
         result["recommendation"] = "buy_yes"
         result["confidence"] = min(edge_yes / 20, 1.0)
         result["trade_price"] = yes_price_cents
         result["reasons"].append(f"YES undervalued by {edge_yes:.0f}¢ — BUY YES (P={prob:.0%})")
-    elif prob < 0.50 and edge_no >= min_edge and no_price_cents > 0:
+    elif prob < 0.50 and edge_no >= effective_min_edge and no_price_cents > 0:
         result["recommendation"] = "buy_no"
         result["confidence"] = min(edge_no / 20, 1.0)
         result["trade_price"] = no_price_cents

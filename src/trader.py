@@ -669,6 +669,35 @@ class Trader:
             except Exception as e:
                 self.logger.debug(f"HMM shadow error: {e}")
 
+            # Resolve expired shadow predictions and report
+            try:
+                resolved = self.hmm_shadow.resolve_expired_predictions(markets)
+                if resolved:
+                    for r in resolved:
+                        self.logger.info(f"HMM shadow: {r['ticker']} {r['side']} → {r['outcome']} ({r['pnl_cents']:+.0f}¢)")
+
+                # Report HMM shadow performance every 50 cycles (~17 min at 20s)
+                if not hasattr(self, '_hmm_report_counter'):
+                    self._hmm_report_counter = 0
+                self._hmm_report_counter += 1
+                if self._hmm_report_counter >= 50:
+                    self._hmm_report_counter = 0
+                    metrics = self.hmm_shadow.get_rolling_metrics(days=3)
+                    if metrics["trade_count"] > 0:
+                        report = self.hmm_shadow.format_report(days=3)
+                        self.logger.info(f"HMM Shadow Status:\n{report}")
+                        self.notifier.send_message(report)
+
+                        # Check graduation: 75% win rate with 20+ trades
+                        if self.hmm_shadow.check_graduation(min_trades=20, min_win_rate=0.75):
+                            self.notifier.send_message(
+                                "🚀 HMM GRADUATION READY\n\n"
+                                f"Win rate >= 75% with {metrics['trade_count']} trades.\n"
+                                "Ready to switch to HMM-driven trading."
+                            )
+            except Exception as e:
+                self.logger.debug(f"HMM shadow resolve error: {e}")
+
             market_data = {"markets": markets}
             trade_decision = self._make_trade_decision(market_data)
             if trade_decision:
