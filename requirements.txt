@@ -22,6 +22,9 @@ scikit-learn
 # Volatility Analysis
 arch
 
+# HMM Regime Detection
+hmmlearn>=0.3.0
+
 # Risk Management & Analytics
 yfinance
 

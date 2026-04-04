@@ -82,9 +82,24 @@ def main():
         except Exception as e:
             logger.warning(f"Initial retrain skipped: {e}")
 
+        # Start HMM observation pipeline
+        from hmm_observations import ObservationPipeline
+        hmm_pipeline = ObservationPipeline(trader.db)
+        hmm_observation_counter = 0
+
         while True:
             logger.info("Running trading strategy with real-time market data")
             trader.run_trading_strategy()
+
+            # Record HMM observations every ~60s (every 3rd cycle at 20s interval)
+            hmm_observation_counter += 1
+            if hmm_observation_counter >= 3:
+                hmm_observation_counter = 0
+                try:
+                    hmm_pipeline.record_all_assets()
+                except Exception as e:
+                    logger.debug(f"HMM observation error: {e}")
+
             time.sleep(TRADE_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:

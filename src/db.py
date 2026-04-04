@@ -126,6 +126,65 @@ CREATE INDEX IF NOT EXISTS idx_trades_asset_ts       ON trades(asset, timestamp)
 CREATE INDEX IF NOT EXISTS idx_trades_strategy       ON trades(strategy);
 CREATE INDEX IF NOT EXISTS idx_sentiment_asset_ts    ON news_sentiment(asset, timestamp);
 CREATE INDEX IF NOT EXISTS idx_crypto_prices_asset_ts ON crypto_prices(asset, timestamp);
+
+CREATE TABLE IF NOT EXISTS hmm_observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset           TEXT NOT NULL,
+    timestamp       TEXT NOT NULL,
+    log_return_1m   REAL,
+    log_return_5m   REAL,
+    log_return_15m  REAL,
+    realized_vol_15m REAL,
+    realized_vol_1h REAL,
+    vol_of_vol      REAL,
+    momentum_r_sq   REAL,
+    mean_reversion  REAL,
+    bid_ask_spread  REAL,
+    spread_vol      REAL,
+    volume_1m       REAL,
+    volume_accel    REAL,
+    has_active_contract INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_hmm_obs_asset_ts ON hmm_observations(asset, timestamp);
+
+CREATE TABLE IF NOT EXISTS hmm_shadow_predictions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset           TEXT NOT NULL,
+    ticker          TEXT,
+    timestamp       TEXT NOT NULL,
+    regime_posterior TEXT,
+    regime_entropy  REAL,
+    top_state       INTEGER,
+    top_state_prob  REAL,
+    fair_prob       REAL,
+    market_price    REAL,
+    edge_cents      REAL,
+    ev_cents        REAL,
+    confidence      REAL,
+    recommendation  TEXT,
+    position_size   INTEGER,
+    outcome         TEXT,
+    pnl_cents       REAL,
+    resolved_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_hmm_shadow_asset_ts ON hmm_shadow_predictions(asset, timestamp);
+CREATE INDEX IF NOT EXISTS idx_hmm_shadow_outcome ON hmm_shadow_predictions(outcome);
+
+CREATE TABLE IF NOT EXISTS hmm_model_state (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset           TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    n_states        INTEGER NOT NULL,
+    bic             REAL,
+    log_likelihood  REAL,
+    stability_flags INTEGER DEFAULT 0,
+    state_means     TEXT,
+    transition_matrix TEXT,
+    trained_at      TEXT NOT NULL,
+    observation_count INTEGER
+);
 """
 
 
@@ -499,3 +558,195 @@ class TradingDB:
                     row.pop("timestamp", None)
                     positions[mid] = row
                 return positions
+
+    # ------------------------------------------------------------------
+    # HMM observation methods
+    # ------------------------------------------------------------------
+
+    def record_hmm_observation(
+        self,
+        asset: str,
+        log_return_1m: float = None,
+        log_return_5m: float = None,
+        log_return_15m: float = None,
+        realized_vol_15m: float = None,
+        realized_vol_1h: float = None,
+        vol_of_vol: float = None,
+        momentum_r_sq: float = None,
+        mean_reversion: float = None,
+        bid_ask_spread: float = None,
+        spread_vol: float = None,
+        volume_1m: float = None,
+        volume_accel: float = None,
+        has_active_contract: int = 0,
+        timestamp: str = None,
+    ) -> int:
+        """Insert an HMM feature observation row. Returns lastrowid."""
+        asset = asset.upper()
+        timestamp = timestamp or _now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO hmm_observations "
+                    "(asset, timestamp, log_return_1m, log_return_5m, log_return_15m, "
+                    "realized_vol_15m, realized_vol_1h, vol_of_vol, momentum_r_sq, "
+                    "mean_reversion, bid_ask_spread, spread_vol, volume_1m, volume_accel, "
+                    "has_active_contract) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (asset, timestamp, log_return_1m, log_return_5m, log_return_15m,
+                     realized_vol_15m, realized_vol_1h, vol_of_vol, momentum_r_sq,
+                     mean_reversion, bid_ask_spread, spread_vol, volume_1m, volume_accel,
+                     has_active_contract),
+                )
+                return cur.lastrowid
+
+    def get_hmm_observations(
+        self,
+        asset: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: int = 50000,
+    ) -> List[Dict[str, Any]]:
+        """Query HMM observations with optional asset/since filters, ordered by timestamp ASC."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if asset:
+            clauses.append("asset = ?")
+            params.append(asset.upper())
+        if since:
+            clauses.append("timestamp >= ?")
+            params.append(since)
+        sql = "SELECT * FROM hmm_observations"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY timestamp ASC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # HMM shadow prediction methods
+    # ------------------------------------------------------------------
+
+    def record_shadow_prediction(
+        self,
+        asset: str,
+        ticker: str = None,
+        regime_posterior: str = None,
+        regime_entropy: float = None,
+        top_state: int = None,
+        top_state_prob: float = None,
+        fair_prob: float = None,
+        market_price: float = None,
+        edge_cents: float = None,
+        ev_cents: float = None,
+        confidence: float = None,
+        recommendation: str = None,
+        position_size: int = None,
+        timestamp: str = None,
+    ) -> int:
+        """Insert a shadow (paper) prediction. Returns lastrowid."""
+        asset = asset.upper()
+        timestamp = timestamp or _now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO hmm_shadow_predictions "
+                    "(asset, ticker, timestamp, regime_posterior, regime_entropy, "
+                    "top_state, top_state_prob, fair_prob, market_price, edge_cents, "
+                    "ev_cents, confidence, recommendation, position_size) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (asset, ticker, timestamp, regime_posterior, regime_entropy,
+                     top_state, top_state_prob, fair_prob, market_price, edge_cents,
+                     ev_cents, confidence, recommendation, position_size),
+                )
+                return cur.lastrowid
+
+    def resolve_shadow_prediction(
+        self,
+        prediction_id: int,
+        outcome: str,
+        pnl_cents: float = None,
+    ) -> None:
+        """Resolve a shadow prediction with outcome and optional PnL."""
+        resolved_at = _now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE hmm_shadow_predictions "
+                    "SET outcome = ?, pnl_cents = ?, resolved_at = ? "
+                    "WHERE id = ?",
+                    (outcome, pnl_cents, resolved_at, prediction_id),
+                )
+
+    def get_shadow_predictions(
+        self,
+        asset: Optional[str] = None,
+        since: Optional[str] = None,
+        resolved_only: bool = False,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """Query shadow predictions with optional filters."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if asset:
+            clauses.append("asset = ?")
+            params.append(asset.upper())
+        if since:
+            clauses.append("timestamp >= ?")
+            params.append(since)
+        if resolved_only:
+            clauses.append("outcome IS NOT NULL")
+        sql = "SELECT * FROM hmm_shadow_predictions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # HMM model state methods
+    # ------------------------------------------------------------------
+
+    def save_hmm_model_state(
+        self,
+        asset: str,
+        version: int,
+        n_states: int,
+        bic: float = None,
+        log_likelihood: float = None,
+        stability_flags: int = 0,
+        state_means: str = None,
+        transition_matrix: str = None,
+        observation_count: int = 0,
+        trained_at: str = None,
+    ) -> int:
+        """Save a trained HMM model state snapshot. Returns lastrowid."""
+        asset = asset.upper()
+        trained_at = trained_at or _now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO hmm_model_state "
+                    "(asset, version, n_states, bic, log_likelihood, stability_flags, "
+                    "state_means, transition_matrix, trained_at, observation_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (asset, version, n_states, bic, log_likelihood, stability_flags,
+                     state_means, transition_matrix, trained_at, observation_count),
+                )
+                return cur.lastrowid
+
+    def get_latest_hmm_model_state(self, asset: str) -> Optional[Dict[str, Any]]:
+        """Load the latest model state for an asset (by version DESC)."""
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM hmm_model_state WHERE asset = ? "
+                    "ORDER BY version DESC LIMIT 1",
+                    (asset.upper(),),
+                ).fetchone()
+                return dict(row) if row else None
