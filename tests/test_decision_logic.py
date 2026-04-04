@@ -228,3 +228,31 @@ def test_15m_no_volume_boost():
             edge *= 1.2
 
     assert edge == 10.0, f"15M edge should not be boosted, got {edge}"
+
+
+def test_cooldown_is_5_minutes():
+    """Value bet cooldown should be 300s (5 min), not 900s."""
+    import time as time_mod
+    from trader import Trader
+    from unittest.mock import MagicMock, patch
+
+    with patch('trader.load_current_params', return_value={'version': 0}), \
+         patch('trader.PerformanceAnalytics'), \
+         patch('trader.MarketDataStreamer'), \
+         patch('trader.SettingsManager') as sm_mock:
+        sm_mock.return_value.settings = MagicMock(
+            news_sentiment_enabled=False, statistical_arbitrage_enabled=False,
+            volatility_based_enabled=False,
+        )
+        sm_mock.return_value.add_change_listener = MagicMock()
+        trader = Trader(MagicMock(), MagicMock(), MagicMock(), 1000)
+
+    # Last trade 6 min ago — should NOT be blocked
+    trader._last_value_bet_time = time_mod.time() - 360
+    result = trader._value_bet_fallback({'markets': []}, None)
+    # Returns None because no markets, but NOT because of cooldown
+
+    # Last trade 2 min ago — should be blocked (returns None from cooldown)
+    trader._last_value_bet_time = time_mod.time() - 120
+    result = trader._value_bet_fallback({'markets': [{'ticker': 'TEST', 'yes_ask_dollars': '0.50'}]}, None)
+    assert result is None  # Blocked by cooldown

@@ -600,7 +600,7 @@ class Trader:
         # Rate limit: max 1 value bet per 5 minutes
         if not hasattr(self, '_last_value_bet_time'):
             self._last_value_bet_time = 0
-        if time.time() - self._last_value_bet_time < 900:  # 15 min cooldown
+        if time.time() - self._last_value_bet_time < 300:  # 5 min cooldown
             return None
 
         # Count positions separately — monthly and 15-min have different limits
