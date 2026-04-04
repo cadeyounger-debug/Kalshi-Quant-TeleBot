@@ -928,10 +928,20 @@ class Trader:
             result = self.api.create_order(order_payload)
             if result:
                 self.logger.info(f"ORDER PLACED: {result}")
+
+                # Use actual filled quantity, not requested
+                order_info = result.get('order', {})
+                filled_str = order_info.get('fill_count_fp', str(quantity))
+                filled_qty = int(float(filled_str)) if filled_str else quantity
+                if filled_qty == 0:
+                    filled_qty = quantity  # Resting order, may fill later
+                elif filled_qty < quantity:
+                    self.logger.info(f"Partial fill: {filled_qty}/{quantity} contracts filled")
+
                 self.db.record_trade(
                     event_id,
                     side=side,
-                    quantity=quantity,
+                    quantity=filled_qty,
                     price=price_cents,
                     strategy=strategy,
                     order_result=str(result),
@@ -954,7 +964,7 @@ class Trader:
                 'ticker': event_id,
                 'action': 'sell',
                 'side': side,
-                'count': quantity,
+                'count': filled_qty,
                 'type': 'limit',
             }
             if side == 'yes':
@@ -977,7 +987,7 @@ class Trader:
                 market_id=event_id,
                 strategy=strategy,
                 side=action.lower(),
-                quantity=quantity,
+                quantity=filled_qty,
                 entry_price=price,
                 confidence=trade_decision.get('confidence', 0.5)
             )
@@ -985,7 +995,7 @@ class Trader:
 
             # Store position locally and persist to database
             position = {
-                'quantity': quantity,
+                'quantity': filled_qty,
                 'entry_price': price_cents,
                 'side': side,
                 'type': 'long' if action.lower() == 'buy' else 'short',

@@ -127,3 +127,54 @@ def test_min_edge_from_param():
     assert result_strict["recommendation"] == "skip", (
         f"With min_edge=15, a 12¢ edge should skip, got {result_strict['recommendation']}"
     )
+
+
+def test_stop_loss_uses_filled_quantity():
+    """Stop loss and position should use actual filled quantity, not requested."""
+    from trader import Trader
+    from unittest.mock import MagicMock, patch
+
+    api = MagicMock()
+    # First call = buy order (partial fill: 1 of 3)
+    # Second call = stop loss order
+    api.create_order.side_effect = [
+        {'order': {
+            'order_id': 'buy-123',
+            'fill_count_fp': '1.00',
+            'initial_count_fp': '3.00',
+            'status': 'resting',
+        }},
+        {'order': {'order_id': 'stop-456'}},
+    ]
+
+    with patch('trader.load_current_params', return_value={'version': 0, 'momentum_weight': 1.0, 'stop_loss_pct': 0.30}), \
+         patch('trader.PerformanceAnalytics'), \
+         patch('trader.MarketDataStreamer'), \
+         patch('trader.SettingsManager') as sm_mock, \
+         patch('trader.TradingDB') as db_mock, \
+         patch('trader.get_crypto_prices', return_value={}), \
+         patch('trader.NewsSentimentAnalyzer'), \
+         patch('trader.StatisticalArbitrageAnalyzer'), \
+         patch('trader.VolatilityAnalyzer'), \
+         patch('trader.RiskManager') as rm_mock:
+        sm_mock.return_value.settings = MagicMock()
+        sm_mock.return_value.add_change_listener = MagicMock()
+        db_mock.return_value.load_positions.return_value = {}
+        rm_mock.return_value.validate_position_size.return_value = True
+        trader = Trader(api, MagicMock(), MagicMock(), bankroll=1000)
+
+    trader.execute_trade({
+        'event_id': 'KXBTC15M-TEST', 'action': 'buy', 'side': 'yes',
+        'quantity': 3, 'price': 50, 'strategy': 'value_bet',
+        'title': 'Test', 'expiration_time': '2026-04-04T00:00:00Z',
+        'confidence': 0.5, 'spot_price': 67000, 'strike_price': 67000,
+    })
+
+    # Verify stop loss was placed for 1 contract (filled), not 3 (requested)
+    assert api.create_order.call_count == 2, f"Expected 2 orders (buy + stop), got {api.create_order.call_count}"
+    stop_payload = api.create_order.call_args_list[1][0][0]
+    assert stop_payload['count'] == 1, f"Stop loss should be for 1 contract (filled qty), got {stop_payload['count']}"
+
+    # Position should track 1 contract
+    pos = trader.current_positions.get('KXBTC15M-TEST', {})
+    assert pos.get('quantity') == 1, f"Position quantity should be 1 (filled), got {pos.get('quantity')}"
