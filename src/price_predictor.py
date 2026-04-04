@@ -304,8 +304,8 @@ def evaluate_contract(
     # Momentum adjustment: is price trending toward or away from strike?
     # momentum_weight is learned daily — scales the ±15% cap up or down
     momentum = compute_momentum(db, asset, strike_price)
-    adj = momentum["adjustment"] * momentum_weight  # scaled by learned weight
-    adj = max(-0.15 * momentum_weight, min(0.15 * momentum_weight, adj))
+    adj = momentum["adjustment"] * min(momentum_weight, 2.0)  # Scale within bounds
+    adj = max(-0.15, min(0.15, adj))  # Fixed ±15% cap, never scales
     prob = max(0.01, min(0.99, base_prob + adj))
 
     # Fair values: prob = chance YES wins

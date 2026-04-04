@@ -66,3 +66,34 @@ def test_prob_51_skips():
     """P=51% is in the 48-52 no-conviction zone — should skip."""
     result = _eval(0.51, yes_price=40, no_price=60)
     assert result["recommendation"] == "skip"
+
+
+def test_momentum_cap_fixed_at_15_pct():
+    """Momentum adjustment must never exceed ±15% regardless of momentum_weight."""
+    db = _make_mock_db()
+    crypto = MagicMock()
+    from datetime import datetime, timedelta, timezone
+    exp = (datetime.now(timezone.utc) + timedelta(hours=0.2)).isoformat()
+
+    with patch('price_predictor.estimate_strike_probability', return_value=0.50), \
+         patch('price_predictor.compute_realized_volatility', return_value=0.50), \
+         patch('price_predictor.compute_momentum', return_value={
+             "has_data": True, "direction": 1.0, "speed_pct_per_min": 5.0,
+             "r_squared": 0.99, "price_vs_strike": 1.0, "adjustment": 0.15,
+             "data_points": 10,
+         }):
+        result = evaluate_contract(
+            db=db, crypto_prices=crypto, ticker="KXBTC15M-TEST",
+            strike_price=67000, spot_price=67100, yes_price_cents=50,
+            no_price_cents=50, expiration_time=exp, asset="BTC",
+            momentum_weight=2.0,
+        )
+
+    # Base = 0.50, max adj should be +0.15, so prob <= 0.65
+    assert result["probability"] <= 0.66, (
+        f"With momentum_weight=2.0, prob should still be capped near 0.65, "
+        f"got {result['probability']}"
+    )
+    assert result["momentum_adj"] <= 0.15, (
+        f"Momentum adj should be capped at 0.15, got {result['momentum_adj']}"
+    )
