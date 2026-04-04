@@ -347,19 +347,21 @@ def evaluate_contract(
         result["reasons"].append(f"Probability {prob:.0%} too close to 50/50 — no conviction")
         return result
 
-    if edge_yes >= min_edge and yes_price_cents > 0:
+    # Only buy the side we think actually wins (prob > 50%)
+    # A "good price" on the losing side is still a losing bet
+    if prob > 0.50 and edge_yes >= min_edge and yes_price_cents > 0:
         result["recommendation"] = "buy_yes"
-        result["confidence"] = min(edge_yes / 20, 1.0)  # 20¢ edge = 100% confidence
+        result["confidence"] = min(edge_yes / 20, 1.0)
         result["trade_price"] = yes_price_cents
-        result["reasons"].append(f"YES undervalued by {edge_yes:.0f}¢ — BUY YES")
-    elif edge_no >= min_edge and no_price_cents > 0:
+        result["reasons"].append(f"YES undervalued by {edge_yes:.0f}¢ — BUY YES (P={prob:.0%})")
+    elif prob < 0.50 and edge_no >= min_edge and no_price_cents > 0:
         result["recommendation"] = "buy_no"
         result["confidence"] = min(edge_no / 20, 1.0)
         result["trade_price"] = no_price_cents
-        result["reasons"].append(f"NO undervalued by {edge_no:.0f}¢ — BUY NO")
+        result["reasons"].append(f"NO undervalued by {edge_no:.0f}¢ — BUY NO (P(no)={1-prob:.0%})")
     else:
         result["recommendation"] = "skip"
-        result["reasons"].append(f"Edge too thin (YES: {edge_yes:+.0f}¢, NO: {edge_no:+.0f}¢, need {min_edge}¢)")
+        result["reasons"].append(f"No winning edge (P={prob:.0%}, YES edge: {edge_yes:+.0f}¢, NO edge: {edge_no:+.0f}¢)")
 
     return result
 
