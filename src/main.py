@@ -82,6 +82,9 @@ def main():
         except Exception as e:
             logger.warning(f"Initial retrain skipped: {e}")
 
+        # Start BTC fast-poller (1-second market updates)
+        trader.start_btc_fast_poller()
+
         # Start HMM observation pipeline
         from hmm_observations import ObservationPipeline
         hmm_pipeline = ObservationPipeline(trader.db)

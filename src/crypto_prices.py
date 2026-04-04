@@ -37,7 +37,7 @@ _TICKER_TO_CG_ID = {v: k for k, v in _COINGECKO_ID_MAP.items()}
 # FreeCryptoAPI uses standard symbols
 _FREE_CRYPTO_SYMBOLS = {"BTC": "BTC", "ETH": "ETH", "SOL": "SOL"}
 
-_CACHE_TTL = 60  # 1 minute for BTC/ETH, fine for FreeCryptoAPI
+_CACHE_TTL = 20  # Refresh every 20s for faster signal detection
 
 
 class CryptoPrices:

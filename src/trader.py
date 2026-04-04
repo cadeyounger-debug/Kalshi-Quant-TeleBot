@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import logging
 import time
+import threading
 from typing import List, Dict, Any
 from config import BANKROLL, NEWS_SENTIMENT_THRESHOLD, STAT_ARBITRAGE_THRESHOLD, VOLATILITY_THRESHOLD, MAX_POSITION_SIZE_PERCENTAGE, STOP_LOSS_PERCENTAGE
 from news_analyzer import NewsSentimentAnalyzer
@@ -158,6 +159,11 @@ class Trader:
         # HMM regime system (shadow mode)
         self.hmm_shadow = ShadowTracker(self.db)
         self.hmm_regime = RegimeEngine(self.db)
+
+        # BTC fast-poller: polls active BTC 15M market every 1 second
+        self._btc_fast_poll_running = False
+        self._btc_fast_poll_thread = None
+        self._btc_latest_market = {}  # Latest BTC 15M market data from fast poller
 
         # Phase 3: Enhanced market data — use longer interval to avoid rate limits
         crypto_events = self._build_crypto_event_tickers()
@@ -478,6 +484,8 @@ class Trader:
                         all_markets.append(m)
 
         self._market_cache = all_markets
+        # Store for BTC fast-poller ticker discovery
+        self._last_markets = {m.get('ticker', ''): m for m in all_markets}
         self.logger.info(f"Fetched {len(all_markets)} active BTC/ETH/SOL markets with liquidity")
         return all_markets
 
@@ -491,6 +499,54 @@ class Trader:
                                f"(trained at {new_params.get('trained_at', 'unknown')})")
         except Exception:
             pass
+
+    def start_btc_fast_poller(self):
+        """Start a background thread that polls the active BTC 15M market every 1s."""
+        if self._btc_fast_poll_running:
+            return
+        self._btc_fast_poll_running = True
+        self._btc_fast_poll_thread = threading.Thread(
+            target=self._btc_fast_poll_loop, daemon=True
+        )
+        self._btc_fast_poll_thread.start()
+        self.logger.info("BTC fast-poller started (1s interval)")
+
+    def stop_btc_fast_poller(self):
+        """Stop the BTC fast-poller thread."""
+        self._btc_fast_poll_running = False
+
+    def _btc_fast_poll_loop(self):
+        """Poll the active BTC 15M market every 1 second."""
+        import time as time_mod
+        current_ticker = None
+
+        while self._btc_fast_poll_running:
+            try:
+                # Find the active BTC 15M ticker from cached markets
+                if not current_ticker:
+                    # Get from the last full market fetch
+                    for mid, pos in list(getattr(self, '_last_markets', {}).items()):
+                        if 'KXBTC15M' in str(mid).upper():
+                            current_ticker = mid
+                            break
+
+                if current_ticker:
+                    result = self.api.get_market(current_ticker)
+                    if result and isinstance(result, dict):
+                        market = result.get('market', result)
+                        self._btc_latest_market = market
+
+                        # Record spot price for momentum computation
+                        spot = market.get('spot_price')
+                        if spot and spot > 0:
+                            self.db.record_crypto_price("BTC", spot)
+
+                time_mod.sleep(1)
+
+            except Exception as e:
+                self.logger.debug(f"BTC fast-poll error: {e}")
+                time_mod.sleep(5)  # Back off on error
+                current_ticker = None  # Re-discover ticker
 
     def run_trading_strategy(self):
         """Main trading loop iteration: check exits, fetch markets, analyse, execute."""
