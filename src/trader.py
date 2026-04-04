@@ -778,14 +778,13 @@ class Trader:
 
             edge = best_edge_here
 
-            # Volume-based edge scaling:
-            # Low volume (< 10) = possible mispricing, slight boost
-            # High volume (> 100) = market is confident, need bigger edge to disagree
-            contract_volume = c['volume'] + c['open_interest']
-            if contract_volume > 100:
-                edge *= 0.8  # Market is well-traded, harder to find real edge
-            elif contract_volume < 10:
-                edge *= 1.2  # Thin market, mispricing more likely
+            # Volume-based edge scaling (non-15M only — 15M always starts at vol=0)
+            if not is_15m:
+                contract_volume = c['volume'] + c['open_interest']
+                if contract_volume > 100:
+                    edge *= 0.8
+                elif contract_volume < 10:
+                    edge *= 1.2
 
             # Boost edge based on window timing
             if is_15m:
@@ -909,21 +908,22 @@ class Trader:
             # On Kalshi we always BUY — either YES or NO side
             # side comes from trade_decision if set, otherwise derive from action
             side = trade_decision.get('side', 'yes' if action.lower() == 'buy' else 'no')
-            order_type = 'market' if price_cents < 3 else 'limit'
+            # Pay 1¢ above ask to cross the spread and fill immediately
+            fill_price = min(price_cents + 1, 99)
             order_payload = {
                 'ticker': event_id,
                 'action': 'buy',
                 'side': side,
                 'count': quantity,
-                'type': order_type,
+                'type': 'limit',
             }
             if side == 'yes':
-                order_payload['yes_price'] = price_cents
+                order_payload['yes_price'] = fill_price
             else:
-                order_payload['no_price'] = price_cents
+                order_payload['no_price'] = fill_price
             # Remove None values
             order_payload = {k: v for k, v in order_payload.items() if v is not None}
-            self.logger.info(f"Order payload: {order_payload}")
+            self.logger.info(f"Order payload (ask={price_cents}¢, fill_price={fill_price}¢): {order_payload}")
 
             result = self.api.create_order(order_payload)
             if not result:
@@ -1245,7 +1245,6 @@ class Trader:
         sell_price = max(1, min(sell_price, 99))
 
         try:
-            # To close: sell as limit order at the current bid price
             order_payload = {
                 'ticker': market_id,
                 'action': 'sell',
@@ -1295,7 +1294,7 @@ class Trader:
                 self.logger.warning(f"Close order for {market_id} did not fill")
                 return
 
-            # P&L = (sell price - entry price) * quantity, always same logic
+            # P&L uses the aggressive sell price we actually submitted
             pnl_cents = (sell_price - entry) * close_filled
             pnl_dollars = pnl_cents / 100
 

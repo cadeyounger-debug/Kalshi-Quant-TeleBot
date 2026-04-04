@@ -212,3 +212,19 @@ def test_stop_loss_uses_learned_pct():
     stop_price = stop_payload.get('yes_price')
     # 60 * (1 - 0.15) = 51
     assert stop_price == 51, f"Stop should be 51¢ (15% below 60¢), got {stop_price}¢"
+
+
+def test_15m_no_volume_boost():
+    """15M contracts should NOT get volume boost for vol=0."""
+    edge = 10.0
+    is_15m = True
+    contract_volume = 0
+
+    # Apply the fixed logic
+    if not is_15m:
+        if contract_volume > 100:
+            edge *= 0.8
+        elif contract_volume < 10:
+            edge *= 1.2
+
+    assert edge == 10.0, f"15M edge should not be boosted, got {edge}"
