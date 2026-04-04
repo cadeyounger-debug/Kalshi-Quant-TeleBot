@@ -744,7 +744,7 @@ class Trader:
                 expiration_time=exp_time,
                 asset=asset,
                 momentum_weight=self.model_params.get("momentum_weight", 1.0),
-                min_edge_override=self.model_params.get("min_edge") if self.model_params.get("min_edge") else None,
+                min_edge_override=self.model_params.get("min_edge_cents") or None,
             )
 
             vol_str = f"vol={c['volume']}, OI={c['open_interest']}"
@@ -1008,7 +1008,7 @@ class Trader:
             # This fires instantly via Kalshi's matching engine instead of
             # waiting for our 60s polling loop. The momentum-based exits
             # handle smart exits; this is the emergency parachute.
-            sl_pct = self.model_params.get("stop_loss_pct", 0.30)
+            sl_pct = self.model_params.get("stop_loss_pct", 0.10)
             sl_pct = min(sl_pct, 0.30)  # Never wider than 30%
             stop_price = max(1, int(price_cents * (1 - sl_pct)))
             stop_payload = {

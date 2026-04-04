@@ -39,7 +39,7 @@ DEFAULT_PARAMS = {
     "data_points": 0,
     "min_entry_price_cents": 20,
     "max_entry_price_cents": 80,
-    "min_edge": 0.05,
+    "min_edge_cents": 5,
     "buy_yes_below": 45,
     "buy_no_above": 55,
     "stop_loss_pct": 0.10,
@@ -1060,13 +1060,13 @@ def compute_optimal_params(
         # If yesterday's overall win rate was bad, tighten stop loss and raise min edge
         if yesterday_wr < 0.40:
             params["stop_loss_pct"] = max(round(params["stop_loss_pct"] * 0.8, 2), 0.05)
-            params["min_edge"] = min(round(params.get("min_edge", 0.05) * 1.3, 2), 0.15)
+            params["min_edge_cents"] = min(round(params.get("min_edge_cents", 5) * 1.3), 15)
             logger.info(f"Yesterday win_rate={yesterday_wr:.0%} — tightening SL to "
-                        f"{params['stop_loss_pct']:.0%}, min_edge to {params['min_edge']}")
+                        f"{params['stop_loss_pct']:.0%}, min_edge to {params['min_edge_cents']}¢")
         elif yesterday_wr > 0.65:
             # Winning streak — slightly loosen to capture more trades
-            params["min_edge"] = max(round(params.get("min_edge", 0.05) * 0.85, 2), 0.03)
-            logger.info(f"Yesterday win_rate={yesterday_wr:.0%} — loosening min_edge to {params['min_edge']}")
+            params["min_edge_cents"] = max(round(params.get("min_edge_cents", 5) * 0.85), 3)
+            logger.info(f"Yesterday win_rate={yesterday_wr:.0%} — loosening min_edge to {params['min_edge_cents']}¢")
 
         # Tune momentum weight based on yesterday's momentum accuracy
         # This scales the ±15% cap in price_predictor.compute_momentum
@@ -1174,7 +1174,7 @@ def retrain():
                 f"BE@{new_params.get('breakeven_trigger', 0.15):.0%}, "
                 f"Trail@{new_params.get('trail_trigger', 0.25):.0%} ({new_params.get('trail_pct', 0.20):.0%})")
     logger.info(f"Momentum weight: {new_params.get('momentum_weight', 1.0)}")
-    logger.info(f"Min edge: {new_params.get('min_edge', 0.05)}")
+    logger.info(f"Min edge: {new_params.get('min_edge_cents', 5)}¢")
     logger.info(f"Strategies: {new_params['strategy_weights']}")
     logger.info(f"Assets: {new_params['asset_weights']}")
 
